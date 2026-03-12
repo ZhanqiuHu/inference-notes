@@ -4,11 +4,11 @@ Usage:
     python summarize.py <results_dir>
 
 Expects results_dir to contain some/all of:
-    config_d_aggregated_plain.json    (Baseline)
-    config_a_aggregated_eagle3.json   (Baseline + EAGLE3)
-    config_b_pure_disagg.json         (DisAgg)
-    config_c_disagg_eagle3.json       (DisAgg + EAGLE3)
-    config_{a,b,c,d}_metrics.json     (NIXL/spec-decode metrics)
+    config_a_baseline.json              (Baseline)
+    config_b_baseline_eagle3.json       (Baseline + EAGLE3)
+    config_c_disagg_1p1d.json           (DisAgg 1P1D)
+    config_d_disagg_eagle3_1p1d.json    (DisAgg + EAGLE3 1P1D)
+    config_{a..h}_metrics.json          (NIXL/spec-decode metrics)
 """
 
 import json
@@ -17,28 +17,28 @@ import sys
 
 
 CONFIG_MAP = {
-    "D": {
-        "label": "Baseline",
-        "bench_file": "config_d_aggregated_plain.json",
-        "metrics_file": "config_d_metrics.json",
-        "num_gpus": 1,
-    },
     "A": {
-        "label": "Baseline + EAGLE3",
-        "bench_file": "config_a_aggregated_eagle3.json",
+        "label": "Baseline",
+        "bench_file": "config_a_baseline.json",
         "metrics_file": "config_a_metrics.json",
         "num_gpus": 1,
     },
     "B": {
-        "label": "DisAgg (1P1D)",
-        "bench_file": "config_b_pure_disagg.json",
+        "label": "Baseline + EAGLE3",
+        "bench_file": "config_b_baseline_eagle3.json",
         "metrics_file": "config_b_metrics.json",
-        "num_gpus": 2,
+        "num_gpus": 1,
     },
     "C": {
-        "label": "DisAgg + EAGLE3 (1P1D)",
-        "bench_file": "config_c_disagg_eagle3.json",
+        "label": "DisAgg (1P1D)",
+        "bench_file": "config_c_disagg_1p1d.json",
         "metrics_file": "config_c_metrics.json",
+        "num_gpus": 2,
+    },
+    "D": {
+        "label": "DisAgg + EAGLE3 (1P1D)",
+        "bench_file": "config_d_disagg_eagle3_1p1d.json",
+        "metrics_file": "config_d_metrics.json",
         "num_gpus": 2,
     },
     "E": {
@@ -48,14 +48,14 @@ CONFIG_MAP = {
         "num_gpus": 3,
     },
     "F": {
-        "label": "DisAgg (1P2D)",
-        "bench_file": "config_f_disagg_1p2d.json",
+        "label": "DisAgg + EAGLE3 (2P1D)",
+        "bench_file": "config_f_disagg_eagle3_2p1d.json",
         "metrics_file": "config_f_metrics.json",
         "num_gpus": 3,
     },
     "G": {
-        "label": "DisAgg + EAGLE3 (2P1D)",
-        "bench_file": "config_g_disagg_eagle3_2p1d.json",
+        "label": "DisAgg (1P2D)",
+        "bench_file": "config_g_disagg_1p2d.json",
         "metrics_file": "config_g_metrics.json",
         "num_gpus": 3,
     },
@@ -91,7 +91,7 @@ def main():
     results_dir = sys.argv[1]
     rows = []
 
-    for config_key in ["D", "A", "B", "C", "E", "F", "G", "H"]:
+    for config_key in ["A", "B", "C", "D", "E", "F", "G", "H"]:
         cfg = CONFIG_MAP[config_key]
         bench = load_json(os.path.join(results_dir, cfg["bench_file"]))
         metrics = load_json(os.path.join(results_dir, cfg["metrics_file"]))
@@ -198,14 +198,21 @@ def main():
     print("=" * 120)
 
     # ── Relative comparisons ─────────────────────────────────────────
+    # (metric_label, key, higher_is_better)
     compare_metrics = [
-        ("RPS", "rps"),
-        ("RPS/GPU", "rps_per_gpu"),
-        ("Out tok/s", "output_tps"),
-        ("tok/s/GPU", "tps_per_gpu"),
-        ("TTFT", "mean_ttft"),
-        ("TPOT", "mean_tpot"),
+        ("RPS", "rps", True),
+        ("RPS/GPU", "rps_per_gpu", True),
+        ("Out tok/s", "output_tps", True),
+        ("tok/s/GPU", "tps_per_gpu", True),
+        ("TTFT", "mean_ttft", False),
+        ("TPOT", "mean_tpot", False),
     ]
+
+    def fmt_delta(delta: float, higher_is_better: bool) -> str:
+        sign = "+" if delta >= 0 else ""
+        good = (delta > 0) == higher_is_better
+        indicator = "\U0001f7e2" if good else "\U0001f534"
+        return f"{indicator} {sign}{delta:.1f}%"
 
     def print_relative(base_config: str, base_label: str,
                        compare_configs: list[str] | None = None):
@@ -220,18 +227,19 @@ def main():
             if compare_configs and row["config"] not in compare_configs:
                 continue
             parts = []
-            for metric, key in compare_metrics:
+            for metric, key, hib in compare_metrics:
                 bv = base.get(key)
                 rv = row.get(key)
                 if bv and rv:
                     delta = ((rv - bv) / bv) * 100
-                    sign = "+" if delta >= 0 else ""
-                    parts.append(f"{sign}{delta:.1f}% {metric}")
+                    parts.append(f"{fmt_delta(delta, hib)} {metric}")
             print(f"  {row['label']}: {', '.join(parts)}")
 
     if len(rows) >= 2:
-        print_relative("D", "Baseline")
-        print_relative("B", "DisAgg (1P1D)", compare_configs=["C"])
+        print_relative("A", "Baseline")
+        print_relative("C", "DisAgg (1P1D)", compare_configs=["D"])
+        print_relative("E", "DisAgg (2P1D)", compare_configs=["F"])
+        print_relative("G", "DisAgg (1P2D)", compare_configs=["H"])
 
     # ── Save structured summary ──────────────────────────────────────
     summary_json_path = os.path.join(results_dir, "summary.json")

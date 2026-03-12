@@ -356,6 +356,7 @@ class BenchConfig:
         self.hf_output_len = getattr(args, "hf_output_len", None)
         self.bench_max_concurrency = getattr(args, "bench_max_concurrency", None)
         self.max_num_seqs = getattr(args, "max_num_seqs", None)
+        self.enforce_eager = not getattr(args, "no_enforce_eager", False)
 
         self.prefill_spec_config = json.dumps({
             "method": self.sd_method,
@@ -378,13 +379,14 @@ class BenchConfig:
     def base_serve_args(self) -> list[str]:
         args = [
             "vllm", "serve", self.model_name,
-            "--enforce-eager",
             "--max-model-len", str(self.max_model_len),
             "--block-size", str(self.block_size),
             "--gpu-memory-utilization", str(self.gpu_memory_utilization),
             "--attention-backend", "FLASH_ATTN",
             "--no-enable-prefix-caching",
         ]
+        if self.enforce_eager:
+            args.append("--enforce-eager")
         if self.max_num_seqs:
             args.extend(["--max-num-seqs", str(self.max_num_seqs)])
         return args
@@ -395,17 +397,16 @@ class BenchConfig:
 # ── Config runners ───────────────────────────────────────────────────────
 
 def run_config_a(cfg: BenchConfig) -> bool:
-    """Config A: Baseline + EAGLE3 (single server, 1 GPU)."""
+    """Config A: Baseline (single server, 1 GPU, no spec decode)."""
     port = find_free_port()
 
     log("")
     log("=" * 60)
-    log(f"Config A: Baseline + EAGLE3 (GPU {cfg.gpu0}, port {port})")
+    log(f"Config A: Baseline (GPU {cfg.gpu0}, port {port})")
     log("=" * 60)
 
     cmd = cfg.base_serve_args() + [
         "--port", str(port),
-        "--speculative-config", cfg.single_spec_config,
     ]
     server_log = os.path.join(cfg.results_dir, "servers_a.log")
     server_proc = start_process(
@@ -429,7 +430,7 @@ def run_config_a(cfg: BenchConfig) -> bool:
 
     collect_metrics(port,
                     os.path.join(cfg.results_dir, "config_a_metrics_pre.json"))
-    ok = run_benchmark(port, "config_a_aggregated_eagle3.json",
+    ok = run_benchmark(port, "config_a_baseline.json",
                        "config_a", cfg)
     collect_metrics(port,
                     os.path.join(cfg.results_dir, "config_a_metrics.json"))
@@ -438,46 +439,47 @@ def run_config_a(cfg: BenchConfig) -> bool:
     return ok
 
 
-def run_config_d(cfg: BenchConfig) -> bool:
-    """Config D: Baseline (single server, 1 GPU, no spec decode)."""
+def run_config_b(cfg: BenchConfig) -> bool:
+    """Config B: Baseline + EAGLE3 (single server, 1 GPU)."""
     port = find_free_port()
 
     log("")
     log("=" * 60)
-    log(f"Config D: Baseline (GPU {cfg.gpu0}, port {port})")
+    log(f"Config B: Baseline + EAGLE3 (GPU {cfg.gpu0}, port {port})")
     log("=" * 60)
 
     cmd = cfg.base_serve_args() + [
         "--port", str(port),
+        "--speculative-config", cfg.single_spec_config,
     ]
-    server_log = os.path.join(cfg.results_dir, "servers_d.log")
+    server_log = os.path.join(cfg.results_dir, "servers_b.log")
     server_proc = start_process(
         cmd,
         env={"CUDA_VISIBLE_DEVICES": str(cfg.gpu0)},
         log_file=server_log,
-        label="server-d",
+        label="server-b",
     )
 
     time.sleep(3)
     if server_proc.poll() is not None:
-        log(f"Config D: server process exited immediately "
+        log(f"Config B: server process exited immediately "
             f"(code={server_proc.returncode})")
         print_log_tail(server_log)
         return False
 
     if not wait_for_server(port):
-        log("Config D: server failed to start")
+        log("Config B: server failed to start")
         print_log_tail(server_log)
         return False
 
     collect_metrics(port,
-                    os.path.join(cfg.results_dir, "config_d_metrics_pre.json"))
-    ok = run_benchmark(port, "config_d_aggregated_plain.json",
-                       "config_d", cfg)
+                    os.path.join(cfg.results_dir, "config_b_metrics_pre.json"))
+    ok = run_benchmark(port, "config_b_baseline_eagle3.json",
+                       "config_b", cfg)
     collect_metrics(port,
-                    os.path.join(cfg.results_dir, "config_d_metrics.json"))
+                    os.path.join(cfg.results_dir, "config_b_metrics.json"))
     cleanup_servers(gpu_ids=[cfg.gpu0, cfg.gpu1])
-    log("Config D complete.")
+    log("Config B complete.")
     return ok
 
 
@@ -623,15 +625,15 @@ def _run_disagg(cfg: BenchConfig, label: str, result_file: str,
     return ok
 
 
-def run_config_b(cfg: BenchConfig) -> bool:
-    """Config B: DisAgg 1P1D, no spec decode."""
-    return _run_disagg(cfg, "b", "config_b_pure_disagg.json",
+def run_config_c(cfg: BenchConfig) -> bool:
+    """Config C: DisAgg 1P1D, no spec decode."""
+    return _run_disagg(cfg, "c", "config_c_disagg_1p1d.json",
                        prefill_gpus=[cfg.gpu0], decode_gpus=[cfg.gpu1])
 
 
-def run_config_c(cfg: BenchConfig) -> bool:
-    """Config C: DisAgg 1P1D + EAGLE3."""
-    return _run_disagg(cfg, "c", "config_c_disagg_eagle3.json",
+def run_config_d(cfg: BenchConfig) -> bool:
+    """Config D: DisAgg 1P1D + EAGLE3."""
+    return _run_disagg(cfg, "d", "config_d_disagg_eagle3_1p1d.json",
                        prefill_gpus=[cfg.gpu0], decode_gpus=[cfg.gpu1],
                        prefill_spec=cfg.prefill_spec_config,
                        decode_spec=cfg.decode_spec_config)
@@ -645,19 +647,19 @@ def run_config_e(cfg: BenchConfig) -> bool:
 
 
 def run_config_f(cfg: BenchConfig) -> bool:
-    """Config F: DisAgg 1P2D, no spec decode."""
-    return _run_disagg(cfg, "f", "config_f_disagg_1p2d.json",
-                       prefill_gpus=[cfg.gpu0],
-                       decode_gpus=[cfg.gpu1, cfg.gpu2])
-
-
-def run_config_g(cfg: BenchConfig) -> bool:
-    """Config G: DisAgg 2P1D + EAGLE3."""
-    return _run_disagg(cfg, "g", "config_g_disagg_eagle3_2p1d.json",
+    """Config F: DisAgg 2P1D + EAGLE3."""
+    return _run_disagg(cfg, "f", "config_f_disagg_eagle3_2p1d.json",
                        prefill_gpus=[cfg.gpu0, cfg.gpu1],
                        decode_gpus=[cfg.gpu2],
                        prefill_spec=cfg.prefill_spec_config,
                        decode_spec=cfg.decode_spec_config)
+
+
+def run_config_g(cfg: BenchConfig) -> bool:
+    """Config G: DisAgg 1P2D, no spec decode."""
+    return _run_disagg(cfg, "g", "config_g_disagg_1p2d.json",
+                       prefill_gpus=[cfg.gpu0],
+                       decode_gpus=[cfg.gpu1, cfg.gpu2])
 
 
 def run_config_h(cfg: BenchConfig) -> bool:
@@ -787,11 +789,11 @@ def parse_args():
     parser.add_argument("--gpu-ids", type=str, default="",
                         help="Comma-separated GPU IDs to reserve (e.g. 0,1)")
     parser.add_argument("--configs", nargs="+",
-                        default=["D", "A", "B", "C"],
-                        help="Configs to run: D=baseline, A=baseline+EAGLE3, "
-                             "B=disagg 1P1D, C=disagg+EAGLE3 1P1D, "
-                             "E=disagg 2P1D, F=disagg 1P2D, "
-                             "G=disagg+EAGLE3 2P1D, H=disagg+EAGLE3 1P2D")
+                        default=["A", "B", "C", "D"],
+                        help="Configs to run: A=baseline, B=baseline+EAGLE3, "
+                             "C=disagg 1P1D, D=disagg+EAGLE3 1P1D, "
+                             "E=disagg 2P1D, F=disagg+EAGLE3 2P1D, "
+                             "G=disagg 1P2D, H=disagg+EAGLE3 1P2D")
 
     parser.add_argument("--model-name", type=str,
                         default=os.environ.get("MODEL_NAME",
@@ -838,6 +840,9 @@ def parse_args():
     parser.add_argument("--max-num-seqs", type=int, default=None,
                         help="Server-side: max sequences per scheduler "
                              "iteration (vLLM default: 256)")
+    parser.add_argument("--no-enforce-eager", action="store_true",
+                        help="Allow CUDA graphs (don't pass --enforce-eager "
+                             "to vllm serve)")
     return parser.parse_args()
 
 
@@ -855,7 +860,7 @@ def main():
 
     # ── GPU setup ────────────────────────────────────────────────────
     configs_upper = [c.upper() for c in args.configs]
-    gpu_needs = {"D": 1, "A": 1, "B": 2, "C": 2,
+    gpu_needs = {"A": 1, "B": 1, "C": 2, "D": 2,
                  "E": 3, "F": 3, "G": 3, "H": 3}
     num_gpus_needed = max(gpu_needs.get(c, 2) for c in configs_upper)
 
@@ -876,7 +881,8 @@ def main():
 
     # ── Results directory ────────────────────────────────────────────
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_dir = str(SCRIPT_DIR / "results" / timestamp)
+    mode_tag = "cudagraph" if args.no_enforce_eager else "eager"
+    results_dir = str(SCRIPT_DIR / "results" / f"{timestamp}_{mode_tag}")
     os.makedirs(results_dir, exist_ok=True)
 
     args.gpu0 = gpus[0]
@@ -895,6 +901,7 @@ def main():
     log(f"GPUs:          {cfg.gpu0}, {cfg.gpu1}")
     log(f"Num prompts:   {cfg.num_prompts}")
     log(f"Request rate:  {cfg.request_rate}")
+    log(f"CUDA graphs:   {'enabled' if not cfg.enforce_eager else 'disabled (eager)'}")
     if cfg.bench_max_concurrency:
         log(f"Bench concurr: {cfg.bench_max_concurrency} (client-side)")
     if cfg.max_num_seqs:
@@ -912,8 +919,8 @@ def main():
 
     # ── Run configs ──────────────────────────────────────────────────
     runners = {
-        "D": run_config_d, "A": run_config_a,
-        "B": run_config_b, "C": run_config_c,
+        "A": run_config_a, "B": run_config_b,
+        "C": run_config_c, "D": run_config_d,
         "E": run_config_e, "F": run_config_f,
         "G": run_config_g, "H": run_config_h,
     }
@@ -922,7 +929,7 @@ def main():
     for c in configs_upper:
         runner = runners.get(c)
         if not runner:
-            log(f"Unknown config: {c} (use A, B, C, or D)")
+            log(f"Unknown config: {c} (use A-H)")
             continue
         try:
             ok = runner(cfg)
