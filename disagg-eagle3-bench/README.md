@@ -9,11 +9,10 @@ Benchmarking the interaction between disaggregated prefill/decode serving and EA
 | **Hardware** | NVIDIA H200 (single node) |
 | **Model** | Qwen/Qwen3-8B |
 | **EAGLE3 Speculator** | RedHatAI/Qwen3-8B-speculator.eagle3 |
-| **Dataset** | [philschmid/mt-bench](https://huggingface.co/datasets/philschmid/mt-bench) (80 unique prompts, avg ~76 input tokens, 256 max output tokens). Run 1: 80 prompts; Run 2: 400 prompts (5x repeated). |
 | **vLLM Version** | 0.15.0rc2.dev (main branch, commit `c4e744dbd`) |
 | **Attention Backend** | FLASH_ATTN |
 | **Prefix Caching** | Disabled |
-| **CUDA Graphs** | Run 1: Disabled (`--enforce-eager`); Run 2: Enabled |
+| **CUDA Graphs** | Enabled |
 | **KV Connector** | NixlConnector (for DisAgg configs) |
 
 ### Configurations
@@ -31,16 +30,9 @@ Benchmarking the interaction between disaggregated prefill/decode serving and EA
 
 ## Results
 
-### Run 1: 80 prompts, 10 RPS, max concurrency 32, eager mode (Configs A-D only)
+### Run 1: MT-bench — 400 prompts, 25 RPS, max concurrency 32
 
-| Config | GPUs | RPS | RPS/GPU | Out tok/s | tok/s/GPU | TTFT (ms) | TPOT (ms) | NIXL xfer | Accept Rate | Accept Len |
-|--------|------|-----|---------|-----------|-----------|-----------|-----------|-----------|-------------|------------|
-| Baseline | 1 | 7.30 | 7.30 | 1869 | 1869 | 39.4 | 11.1 | — | — | — |
-| Baseline + EAGLE3 | 1 | 8.09 | 8.09 | 2068 | 2068 | 52.9 | 6.9 | — | 41.2% | 2.24 |
-| DisAgg (1P1D) | 2 | 7.19 | 3.60 | 1840 | 920 | 142.2 | 11.3 | 11.1ms | — | — |
-| DisAgg + EAGLE3 (1P1D) | 2 | 7.83 | 3.92 | 2005 | 1003 | 173.1 | 7.4 | 11.1ms | 43.6% | 2.23 |
-
-### Run 2: 400 prompts, 25 RPS, max concurrency 32, CUDA graphs enabled (all configs)
+Dataset: [philschmid/mt-bench](https://huggingface.co/datasets/philschmid/mt-bench) (80 unique prompts × 5, avg ~81 input tokens, 256 output token cap).
 
 | Config | GPUs | RPS | RPS/GPU | Out tok/s | tok/s/GPU | TTFT (ms) | TPOT (ms) | NIXL xfer | NIXL MB/s | Accept Len |
 |--------|------|-----|---------|-----------|-----------|-----------|-----------|-----------|-----------|------------|
@@ -65,7 +57,7 @@ Benchmarking the interaction between disaggregated prefill/decode serving and EA
 | DisAgg (1P2D) | 🟢 +9.8% | 🔴 -63.4% | 🟢 +9.7% | 🔴 -63.4% | 🔴 +206% | 🟢 -11.9% |
 | DisAgg + EAGLE3 (1P2D) | 🟢 +37.1% | 🔴 -54.3% | 🟢 +37.1% | 🔴 -54.3% | 🔴 +266% | 🟢 -40.5% |
 
-**EAGLE3 uplift within each DisAgg topology:**
+**EAGLE3 uplift within each topology:**
 
 | Topology | RPS | RPS/GPU | Out tok/s | tok/s/GPU | TTFT | TPOT |
 |----------|-----|---------|-----------|-----------|------|------|
@@ -73,11 +65,44 @@ Benchmarking the interaction between disaggregated prefill/decode serving and EA
 | 2P1D | 🟢 +26.4% | 🟢 +26.4% | 🟢 +26.4% | 🟢 +26.4% | 🔴 +9.7% | 🟢 -24.0% |
 | 1P2D | 🟢 +24.9% | 🟢 +24.9% | 🟢 +24.9% | 🟢 +24.9% | 🔴 +19.6% | 🟢 -32.5% |
 
+### Run 2: ShareGPT — 400 prompts, 25 RPS, max concurrency 32
+
+Dataset: [ShareGPT_V3](https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered) (real multi-turn conversations, avg ~202 input tokens, avg ~221 output tokens).
+
+| Config | GPUs | RPS | RPS/GPU | Out tok/s | tok/s/GPU | TTFT (ms) | TPOT (ms) | NIXL xfer | NIXL MB/s | Accept Len |
+|--------|------|-----|---------|-----------|-----------|-----------|-----------|-----------|-----------|------------|
+| Baseline | 1 | 16.83 | 16.83 | 3722 | 3722 | 27.2 | 7.26 | — | — | — |
+| Baseline + EAGLE3 | 1 | 20.50 | 20.50 | 4534 | 4534 | 40.8 | 5.99 | — | — | 2.170 |
+| DisAgg (1P1D) | 2 | 17.69 | 8.85 | 3914 | 1957 | 79.5 | 6.67 | 6.71ms | 4385 | — |
+| DisAgg + EAGLE3 (1P1D) | 2 | 20.97 | 10.49 | 4640 | 2320 | 101.4 | 5.35 | 9.07ms | 3333 | 2.156 |
+| DisAgg (2P1D) | 3 | 17.46 | 5.82 | 3862 | 1287 | 114.7 | 6.71 | 7.34ms | 4011 | — |
+| DisAgg + EAGLE3 (2P1D) | 3 | 20.53 | 6.84 | 4541 | 1514 | 136.5 | 5.46 | 9.19ms | 3290 | 2.179 |
+| DisAgg (1P2D) | 3 | 18.96 | 6.32 | 4195 | 1398 | 77.3 | 6.11 | 5.45ms | 5874 | — |
+| DisAgg + EAGLE3 (1P2D) | 3 | 21.70 | 7.23 | 4800 | 1600 | 90.0 | 4.48 | 6.55ms | 4871 | 2.209 |
+
+**Relative to Baseline** (🟢 = favorable, 🔴 = unfavorable):
+
+| Config | RPS | RPS/GPU | Out tok/s | tok/s/GPU | TTFT | TPOT |
+|--------|-----|---------|-----------|-----------|------|------|
+| Baseline + EAGLE3 | 🟢 +21.8% | 🟢 +21.8% | 🟢 +21.8% | 🟢 +21.8% | 🔴 +49.9% | 🟢 -17.5% |
+| DisAgg (1P1D) | 🟢 +5.1% | 🔴 -47.4% | 🟢 +5.2% | 🔴 -47.4% | 🔴 +192% | 🟢 -8.1% |
+| DisAgg + EAGLE3 (1P1D) | 🟢 +24.6% | 🔴 -37.7% | 🟢 +24.7% | 🔴 -37.7% | 🔴 +273% | 🟢 -26.3% |
+| DisAgg (2P1D) | 🟢 +3.7% | 🔴 -65.4% | 🟢 +3.8% | 🔴 -65.4% | 🔴 +321% | 🟢 -7.6% |
+| DisAgg + EAGLE3 (2P1D) | 🟢 +22.0% | 🔴 -59.4% | 🟢 +22.0% | 🔴 -59.3% | 🔴 +401% | 🟢 -24.8% |
+| DisAgg (1P2D) | 🟢 +12.7% | 🔴 -62.4% | 🟢 +12.7% | 🔴 -62.4% | 🔴 +184% | 🟢 -15.8% |
+| DisAgg + EAGLE3 (1P2D) | 🟢 +28.9% | 🔴 -57.0% | 🟢 +28.9% | 🔴 -57.0% | 🔴 +231% | 🟢 -38.3% |
+
+**EAGLE3 uplift within each topology:**
+
+| Topology | RPS | RPS/GPU | Out tok/s | tok/s/GPU | TTFT | TPOT |
+|----------|-----|---------|-----------|-----------|------|------|
+| 1P1D | 🟢 +18.5% | 🟢 +18.5% | 🟢 +18.6% | 🟢 +18.6% | 🔴 +27.5% | 🟢 -19.8% |
+| 2P1D | 🟢 +17.6% | 🟢 +17.6% | 🟢 +17.6% | 🟢 +17.6% | 🔴 +19.0% | 🟢 -18.6% |
+| 1P2D | 🟢 +14.5% | 🟢 +14.5% | 🟢 +14.4% | 🟢 +14.4% | 🔴 +16.4% | 🟢 -26.7% |
+
 ## Limitations
 
 - All disagg testing is single-node; cross-node NIXL performance may differ.
-- MT-bench prompts average ~76 input tokens — relatively short for prefill-heavy workloads.
-- Output length is capped at 256 tokens (vLLM default for HF datasets).
 - Single benchmark run per configuration; no variance measured across runs.
 
 ## Reproduction
@@ -88,22 +113,26 @@ cd /path/to/vllm  # vLLM repo (main branch)
 pip install -e .   # or: uv pip install -e .
 pip install datasets
 
-# Run 1: eager mode, configs A-D only
+# Run 1: MT-bench
 python run_bench.py \
   --model-name Qwen/Qwen3-8B \
   --sd-model RedHatAI/Qwen3-8B-speculator.eagle3 \
   --dataset-name hf \
   --hf-name philschmid/mt-bench \
-  --num-prompts 80 \
-  --request-rate 10 \
-  --bench-max-concurrency 32
+  --num-prompts 400 \
+  --request-rate 25 \
+  --bench-max-concurrency 32 \
+  --no-enforce-eager \
+  --configs A B C D E F G H
 
-# Run 2: CUDA graphs, all configs
+# Run 2: ShareGPT (longer prompts, natural output lengths)
+SHAREGPT_PATH=$(hf download anon8231489123/ShareGPT_Vicuna_unfiltered \
+  ShareGPT_V3_unfiltered_cleaned_split.json --repo-type dataset)
 python run_bench.py \
   --model-name Qwen/Qwen3-8B \
   --sd-model RedHatAI/Qwen3-8B-speculator.eagle3 \
-  --dataset-name hf \
-  --hf-name philschmid/mt-bench \
+  --dataset-name sharegpt \
+  --dataset-path "$SHAREGPT_PATH" \
   --num-prompts 400 \
   --request-rate 25 \
   --bench-max-concurrency 32 \

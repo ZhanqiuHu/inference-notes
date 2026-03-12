@@ -116,9 +116,8 @@ def cleanup_servers(gpu_ids: list[int] | None = None):
             capture_output=True, timeout=5,
         )
 
-    time.sleep(3)
-
     if gpu_ids:
+        time.sleep(3)
         check_set = set(gpu_ids)
         for attempt in range(15):
             result = subprocess.run(
@@ -181,8 +180,14 @@ def final_cleanup():
     if _cleanup_done:
         return
     _cleanup_done = True
-    cleanup_servers()
-    release_gpus()
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    try:
+        cleanup_servers()
+    except Exception:
+        pass
+    finally:
+        release_gpus()
 
 
 def print_log_tail(log_file: str, n_lines: int = 30):
