@@ -1,0 +1,24 @@
+{
+  "nixl_xfer_time_seconds": {
+    "count": 80.0,
+    "sum": 0.8911820000000001,
+    "mean": 0.011139775000000001
+  },
+  "nixl_post_time_seconds": {
+    "count": 80.0,
+    "sum": 0.05656799999999999,
+    "mean": 0.0007070999999999999
+  },
+  "nixl_bytes_transferred": {
+    "count": 80.0,
+    "sum": 976748544.0,
+    "mean": 12209356.8
+  },
+  "nixl_num_descriptors": {
+    "count": 80.0,
+    "sum": 5760.0,
+    "mean": 72.0
+  },
+  "nixl_throughput_mb_per_s": 1045.24,
+  "port": 42057
+}

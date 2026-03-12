@@ -1,0 +1,10 @@
+# Server logs (may contain internal IPs/paths)
+*.log
+summary.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# GPU lockfile
+.gpu_lock

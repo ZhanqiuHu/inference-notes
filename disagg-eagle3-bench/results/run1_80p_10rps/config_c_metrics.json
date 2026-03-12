@@ -1,0 +1,27 @@
+{
+  "nixl_xfer_time_seconds": {
+    "count": 80.0,
+    "sum": 0.888098,
+    "mean": 0.011101225000000001
+  },
+  "nixl_post_time_seconds": {
+    "count": 80.0,
+    "sum": 0.04978800000000001,
+    "mean": 0.0006223500000000001
+  },
+  "nixl_bytes_transferred": {
+    "count": 80.0,
+    "sum": 1003880448.0,
+    "mean": 12548505.6
+  },
+  "nixl_num_descriptors": {
+    "count": 80.0,
+    "sum": 5920.0,
+    "mean": 74.0
+  },
+  "spec_decode_num_drafts": 9176.0,
+  "spec_decode_num_accepted": 11278.0,
+  "spec_decode_acceptance_length": 2.229075850043592,
+  "nixl_throughput_mb_per_s": 1078.01,
+  "port": 40973
+}
