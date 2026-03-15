@@ -25,6 +25,7 @@ import os
 import re
 import signal
 import socket
+import statistics
 import subprocess
 import sys
 import threading
@@ -824,6 +825,10 @@ def main():
     parser.add_argument(
         "--skip-assertions", action="store_true",
         help="Don't fail on assertion checks (just print results)")
+    parser.add_argument(
+        "--eval-repeats", type=int, default=1,
+        help="Run lm_eval N times against the same server session "
+             "(default: 1)")
     args = parser.parse_args()
 
     # ── Resolve model ────────────────────────────────────────────────
@@ -1065,35 +1070,58 @@ def main():
 
         eval_url = f"http://localhost:{proxy_port}/v1"
 
-    # ── Collect assertion results ────────────────────────────────────
-    checks: list[dict] = []
+    # ── Eval-repeat loop ─────────────────────────────────────────────
+    all_repeat_results: list[dict] = []
+    any_failed = False
+    slack_url = get_slack_webhook(args.slack_webhook)
+    short_model = model_name.split("/")[-1]
 
-    # ── Quick sanity check ───────────────────────────────────────────
-    log("")
-    log("=" * 70)
-    log("Running quick sanity check (single prompt)...")
-    log("=" * 70)
-    sanity_ok, sanity_text = run_quick_sanity(eval_url, model_name,
-                                              seed=args.seed)
-    checks.append({
-        "name": "Quick sanity (coherent output)",
-        "passed": sanity_ok,
-        "value": sanity_text[:80],
-        "value_str": "OK" if sanity_ok else "FAIL",
-    })
+    for eval_rep in range(1, args.eval_repeats + 1):
+        rep_suffix = f"_r{eval_rep}" if args.eval_repeats > 1 else ""
+        if args.eval_repeats > 1:
+            log(f"\n{'=' * 70}")
+            log(f"Eval repeat {eval_rep}/{args.eval_repeats}")
+            log(f"{'=' * 70}")
 
-    if args.quick:
-        log("--quick mode: skipping lm_eval")
-    else:
+        checks: list[dict] = []
+        measured = None
+
+        # ── Quick sanity check (first repeat only) ───────────────────
+        if eval_rep == 1:
+            log("")
+            log("=" * 70)
+            log("Running quick sanity check (single prompt)...")
+            log("=" * 70)
+            sanity_ok, sanity_text = run_quick_sanity(eval_url, model_name,
+                                                      seed=args.seed)
+            checks.append({
+                "name": "Quick sanity (coherent output)",
+                "passed": sanity_ok,
+                "value": sanity_text[:80],
+                "value_str": "OK" if sanity_ok else "FAIL",
+            })
+
+        if args.quick:
+            if eval_rep == 1:
+                log("--quick mode: skipping lm_eval")
+            all_repeat_results.append({
+                "repeat": eval_rep,
+                "checks": checks,
+                "all_passed": all(c["passed"] for c in checks),
+                "score": None,
+            })
+            break
+
         # ── Run lm_eval ──────────────────────────────────────────────
         log("")
         log("=" * 70)
         log(f"Running lm_eval gsm8k {NUM_FEWSHOT}-shot against {eval_url}")
         log("=" * 70)
 
+        eval_log = os.path.join(
+            results_dir, f"lm_eval_output{rep_suffix}.log")
         measured = run_lm_eval(
-            eval_url, model_name,
-            os.path.join(results_dir, "lm_eval_output.log"),
+            eval_url, model_name, eval_log,
             limit=eval_limit,
             eval_temperature=args.eval_temperature,
             log_samples=args.log_samples,
@@ -1101,7 +1129,6 @@ def main():
         )
         expected = model_cfg["expected_gsm8k"]
 
-        # Accuracy check
         if measured is not None:
             if expected is not None:
                 diff = abs(measured - expected)
@@ -1131,30 +1158,62 @@ def main():
                 "detail": "lm_eval did not return a score",
             })
 
-    # ── Cache hit rate check (P/D mode only) ─────────────────────────
-    if decoder_ports:
-        hit_passed, hit_rate, hit_detail = check_cache_hit_rate(decoder_ports)
+        # ── Cache hit rate check (P/D mode only) ─────────────────────
+        if decoder_ports:
+            hit_passed, hit_rate, hit_detail = check_cache_hit_rate(
+                decoder_ports)
+            checks.append({
+                "name": "External KV cache hit rate",
+                "passed": hit_passed,
+                "value": hit_rate,
+                "value_str": f"{hit_rate:.2%}" if hit_rate > 0 else "N/A",
+                "detail": hit_detail,
+            })
+
+        # ── Log error scan ───────────────────────────────────────────
+        err_passed, err_count, err_samples = scan_logs_for_errors(
+            results_dir, server_log_files)
         checks.append({
-            "name": "External KV cache hit rate",
-            "passed": hit_passed,
-            "value": hit_rate,
-            "value_str": f"{hit_rate:.2%}" if hit_rate > 0 else "N/A",
-            "detail": hit_detail,
+            "name": "Transfer errors in logs",
+            "passed": err_passed,
+            "value": err_count,
+            "value_str": str(err_count),
+            "detail": "; ".join(err_samples) if err_samples else "",
         })
 
-    # ── Log error scan ───────────────────────────────────────────────
-    err_passed, err_count, err_samples = scan_logs_for_errors(
-        results_dir, server_log_files)
-    checks.append({
-        "name": "Transfer errors in logs",
-        "passed": err_passed,
-        "value": err_count,
-        "value_str": str(err_count),
-        "detail": "; ".join(err_samples) if err_samples else "",
-    })
+        # ── Print per-repeat summary ─────────────────────────────────
+        if args.eval_repeats > 1:
+            log(f"  [repeat {eval_rep}/{args.eval_repeats}]")
+        all_passed = print_summary(checks)
+        if not all_passed:
+            any_failed = True
 
-    # ── Print summary ────────────────────────────────────────────────
-    all_passed = print_summary(checks)
+        all_repeat_results.append({
+            "repeat": eval_rep,
+            "checks": checks,
+            "all_passed": all_passed,
+            "score": measured,
+        })
+
+        # ── Per-repeat Slack notification ────────────────────────────
+        if slack_url:
+            rep_label = (f" (repeat {eval_rep}/{args.eval_repeats})"
+                         if args.eval_repeats > 1 else "")
+            status = "PASS" if all_passed else "FAIL"
+            emoji = ":white_check_mark:" if all_passed else ":x:"
+            lines = [
+                f"{emoji} *[lm_eval]* `{args.config}` "
+                f"`t={args.eval_temperature}` `c={args.num_concurrent}` "
+                f"@ `{sha[:9]}`{rep_label}",
+                f"Model: `{short_model}`",
+            ]
+            for c in checks:
+                c_emoji = (":white_check_mark:" if c["passed"]
+                           else ":x:")
+                lines.append(
+                    f"{c_emoji} {c['name']}: *{c['value_str']}*")
+            lines.append(f"*{status}*")
+            notify_slack(slack_url, "\n".join(lines))
 
     # ── Write results ────────────────────────────────────────────────
     run_config = {
@@ -1173,29 +1232,77 @@ def main():
             "p_tp": p_tp, "d_tp": d_tp,
             "num_prefill": num_p, "num_decode": num_d,
         })
-    write_results_json(results_dir, run_config, checks)
+
+    scores = [r["score"] for r in all_repeat_results
+              if r["score"] is not None]
+
+    if args.eval_repeats == 1 and all_repeat_results:
+        write_results_json(results_dir, run_config,
+                           all_repeat_results[0]["checks"])
+    else:
+        aggregate = None
+        if len(scores) > 1:
+            aggregate = {
+                "scores": scores,
+                "mean": statistics.mean(scores),
+                "std": statistics.stdev(scores),
+                "min": min(scores),
+                "max": max(scores),
+                "n": len(scores),
+            }
+        results_data = {
+            "timestamp": datetime.now().isoformat(),
+            "config": run_config,
+            "eval_repeats": args.eval_repeats,
+            "repeats": [
+                {
+                    "repeat": r["repeat"],
+                    "checks": [
+                        {"name": c["name"], "passed": c["passed"],
+                         "value": c.get("value"),
+                         "detail": c.get("detail", "")}
+                        for c in r["checks"]
+                    ],
+                    "all_passed": r["all_passed"],
+                    "score": r["score"],
+                }
+                for r in all_repeat_results
+            ],
+        }
+        if aggregate:
+            results_data["aggregate"] = aggregate
+        path = os.path.join(results_dir, "results.json")
+        with open(path, "w") as f:
+            json.dump(results_data, f, indent=2)
+        log(f"Results JSON: {path}")
+
+    # ── Aggregate reporting (eval_repeats > 1) ───────────────────────
+    if len(scores) > 1:
+        mean_s = statistics.mean(scores)
+        std_s = statistics.stdev(scores)
+        log(f"\n{'=' * 70}")
+        log(f"  EVAL REPEAT AGGREGATE ({len(scores)} repeats)")
+        log(f"  Scores: {[f'{s:.4f}' for s in scores]}")
+        log(f"  Mean:   {mean_s:.4f}")
+        log(f"  Std:    {std_s:.4f}")
+        log(f"  Range:  {min(scores):.4f} \u2013 {max(scores):.4f}")
+        log(f"{'=' * 70}")
+
+        if slack_url:
+            notify_slack(
+                slack_url,
+                f":bar_chart: *[lm_eval] AGGREGATE* "
+                f"`{args.config}` `t={args.eval_temperature}` "
+                f"`c={args.num_concurrent}` @ `{sha[:9]}`\n"
+                f"Model: `{short_model}`\n"
+                f"Scores: {[f'{s:.4f}' for s in scores]}\n"
+                f"*Mean: {mean_s:.4f} \u00b1 {std_s:.4f}*\n"
+                f"Range: {min(scores):.4f} \u2013 {max(scores):.4f}",
+            )
 
     log(f"Results dir: {results_dir}")
 
-    # ── Slack notification ────────────────────────────────────────────
-    slack_url = get_slack_webhook(args.slack_webhook)
-    if slack_url:
-        status = "PASS" if all_passed else "FAIL"
-        emoji = ":white_check_mark:" if all_passed else ":x:"
-        short_model = model_name.split("/")[-1]
-        lines = [
-            f"{emoji} *[lm_eval]* `{args.config}` "
-            f"`t={args.eval_temperature}` `c={args.num_concurrent}` "
-            f"@ `{sha[:9]}`",
-            f"Model: `{short_model}`",
-        ]
-        for c in checks:
-            c_emoji = ":white_check_mark:" if c["passed"] else ":x:"
-            lines.append(f"{c_emoji} {c['name']}: *{c['value_str']}*")
-        lines.append(f"*{status}*")
-        notify_slack(slack_url, "\n".join(lines))
-
-    if not all_passed and not args.skip_assertions:
+    if any_failed and not args.skip_assertions:
         sys.exit(1)
 
 

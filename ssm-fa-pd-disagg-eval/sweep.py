@@ -7,7 +7,7 @@ Continues on failure. Each run saves its own results in results/<timestamp>/.
 Usage:
   python my_wip/mamba_hetero_tp_pd_test/sweep.py --gpus 0,1,2,3,4,5,6,7
   python my_wip/mamba_hetero_tp_pd_test/sweep.py --gpus 0,1,2,3 --configs 1p1d 2p2d
-  python my_wip/mamba_hetero_tp_pd_test/sweep.py --gpus 0,1 --configs 1p1d --temps 0.0 --repeats 1
+  python my_wip/mamba_hetero_tp_pd_test/sweep.py --gpus 0,1 --configs 1p1d --temps 0.0 --server-repeats 1
   python my_wip/mamba_hetero_tp_pd_test/sweep.py --gpus 0,1,2,3 --model Qwen/Qwen3-0.6B --wait-gpus
 """
 
@@ -109,23 +109,28 @@ def main():
     parser.add_argument("--temps", nargs="+", type=float,
                         default=[0.0, 0.6, 0.8, 1.0],
                         help="Temperatures (default: 0.0 0.6 0.8 1.0)")
-    parser.add_argument("--repeats", type=int, default=3,
-                        help="Repeats per config/temp (default: 3)")
+    parser.add_argument("--server-repeats", type=int, default=1,
+                        help="Server restarts per config/temp (default: 1)")
+    parser.add_argument("--eval-repeats", type=int, default=1,
+                        help="lm_eval runs per server session, passed to "
+                             "run_lm_eval.py (default: 1)")
     parser.add_argument("--seed", type=int, default=42,
-                        help="Base seed (incremented per repeat)")
+                        help="Base seed (incremented per server-repeat)")
     args = parser.parse_args()
 
-    total_runs = (len(args.models) * len(args.configs)
-                  * len(args.temps) * args.repeats)
+    total_server_runs = (len(args.models) * len(args.configs)
+                         * len(args.temps) * args.server_repeats)
+    total_evals = total_server_runs * args.eval_repeats
 
     log(f"Sweep: {len(args.models)} models x {len(args.configs)} configs "
-        f"x {len(args.temps)} temps x {args.repeats} repeats "
-        f"= {total_runs} runs")
+        f"x {len(args.temps)} temps x {args.server_repeats} server-repeats"
+        f" x {args.eval_repeats} eval-repeats"
+        f" = {total_server_runs} server runs, {total_evals} total evals")
     log(f"  Models:  {args.models}")
     log(f"  Configs: {args.configs}")
     log(f"  Temps:   {args.temps}")
     log(f"  GPUs:    {args.gpus or 'chg auto-reserve per run'}")
-    log(f"  Seed:    {args.seed} (incremented per repeat)")
+    log(f"  Seed:    {args.seed} (incremented per server-repeat)")
 
     print()
     run_idx = 0
@@ -133,12 +138,15 @@ def main():
         log(f"=== Model: {model} ===")
         for config in args.configs:
             for temp in args.temps:
-                for rep in range(1, args.repeats + 1):
+                for rep in range(1, args.server_repeats + 1):
                     run_idx += 1
                     seed = args.seed + rep - 1
-                    log(f"[{run_idx}/{total_runs}] "
+                    er_label = (f" eval-repeats={args.eval_repeats}"
+                                if args.eval_repeats > 1 else "")
+                    log(f"[{run_idx}/{total_server_runs}] "
                         f"{model.split('/')[-1]} {config} temp={temp} "
-                        f"repeat={rep}/{args.repeats} seed={seed}")
+                        f"server-repeat={rep}/{args.server_repeats} "
+                        f"seed={seed}{er_label}")
 
                     cmd = [
                         sys.executable, RUN_LMEVAL, config,
@@ -146,6 +154,8 @@ def main():
                         "--eval-temperature", str(temp),
                         "--seed", str(seed),
                     ]
+                    if args.eval_repeats > 1:
+                        cmd += ["--eval-repeats", str(args.eval_repeats)]
                     if args.gpus:
                         cmd += ["--gpus", args.gpus]
                     if args.skip_reserve:
@@ -155,7 +165,8 @@ def main():
                     log(f"  -> exit_code={result.returncode}")
                     print()
 
-    log(f"Sweep complete. {total_runs} runs attempted.")
+    log(f"Sweep complete. {total_server_runs} server runs attempted "
+        f"({total_evals} total evals).")
     log(f"Results in: {SCRIPT_DIR / 'results'}/")
 
 

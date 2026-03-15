@@ -15,14 +15,24 @@ python run_lm_eval.py 2p2d \
   --num-concurrent 100
 ```
 
-Run a full sweep across configs and temperatures with 5 repeats:
+Run 3 eval repeats per server session (no server restart between evals):
+
+```bash
+python run_lm_eval.py 2p2d \
+  --model nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8 \
+  --eval-temperature 0.0 \
+  --eval-repeats 3
+```
+
+Run a full sweep across configs and temperatures:
 
 ```bash
 python sweep.py \
   --models nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8 \
   --configs standalone 1p1d 2p2d 4p4d \
   --temps 0.0 0.6 0.8 1.0 \
-  --repeats 5
+  --server-repeats 2 \   # restart vLLM servers 2 times per config/temp (seed incremented)
+  --eval-repeats 3        # run lm_eval 3 times per server session → 6 total evals each
 ```
 
 Results land in `results/<timestamp>_<config>/` with `results.json`, server logs, and `lm_eval` output.
@@ -39,6 +49,7 @@ Results land in `results/<timestamp>_<config>/` with `results.json`, server logs
     - [Output](#output)
   - [`sweep.py` — Multi-Run Sweep](#sweeppy--multi-run-sweep)
     - [Sweep Flags](#flags-1)
+- [Eval Repeats](#eval-repeats)
 - [Slack Notifications](#slack-notifications)
 
 ## Requirements
@@ -95,6 +106,7 @@ python run_lm_eval.py 2p2d --model nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8 --l
 | `--log-samples` | `False` | Save per-sample predictions to output dir |
 | `--slack-webhook` | `None` | Slack webhook URL for notifications (also reads `SLACK_WEBHOOK_URL` env or `~/.slack_webhook_url`) |
 | `--skip-assertions` | `False` | Don't fail on assertion checks (just print results) |
+| `--eval-repeats` | `1` | Run `lm_eval` N times against the same server session (see [Eval Repeats](#eval-repeats)) |
 
 #### Supported Models
 
@@ -140,22 +152,32 @@ Results are saved to `results/<timestamp>_<config>/` containing:
 Orchestrates multiple `run_lm_eval.py` runs across configs, temperatures, and repeats.
 
 ```bash
-# Default sweep: 3 configs × 4 temps × 3 repeats = 36 runs
+# Default sweep: 3 configs × 4 temps, single server + single eval per combo
 python sweep.py --models nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8
 
-# Custom sweep
+# Typical usage: both repeat types
+python sweep.py \
+  --models nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8 \
+  --configs 2p2d 4p4d \
+  --temps 0.0 0.6 0.8 1.0 \
+  --server-repeats 2 \   # restart servers 2x per config/temp (catches startup variance)
+  --eval-repeats 3        # run lm_eval 3x per server session (catches eval variance)
+  # total evals per config/temp = 2 × 3 = 6
+
+# Eval-only repeats (no server restarts)
 python sweep.py \
   --models nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8 \
   --configs standalone 1p1d 2p2d 4p4d \
-  --temps 0.0 0.6 0.8 1.0 \
-  --repeats 5
+  --temps 0.0 \
+  --eval-repeats 5        # 5 lm_eval runs per single server session
 
 # Background with nohup
 nohup python sweep.py \
   --models nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8 \
   --configs 2p2d 4p4d \
   --temps 0.0 0.6 0.8 1.0 \
-  --repeats 5 \
+  --server-repeats 2 \   # 2 server restarts
+  --eval-repeats 3 \     # 3 evals per server → 6 total per config/temp
   > ~/nohup_sweep.log 2>&1 &
 ```
 
@@ -166,10 +188,64 @@ nohup python sweep.py \
 | `--models` | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8` | Model name(s), space-separated |
 | `--configs` | `1p1d 2p2d 4p4d` | Configs to test |
 | `--temps` | `0.0 0.6 0.8 1.0` | Temperatures to sweep |
-| `--repeats` | `3` | Repeats per config/temp |
-| `--seed` | `42` | Base seed (incremented per repeat: 42, 43, 44, ...) |
+| `--server-repeats` | `1` | Server restarts per config/temp (seed incremented per restart) |
+| `--eval-repeats` | `1` | `lm_eval` runs per server session (passed through to `run_lm_eval.py`) |
+| `--seed` | `42` | Base seed (incremented per server-repeat: 42, 43, 44, ...) |
 | `--gpus` | auto (via `chg`) | Comma-separated GPU IDs |
 | `--skip-reserve` | `False` | Bypass `chg` reservation |
+
+---
+
+## Eval Repeats
+
+`--eval-repeats N` runs `lm_eval` N times against **the same running server session**, without restarting vLLM between evaluations. This is useful for measuring variance from the evaluation harness itself while holding the server state fixed.
+
+**Behavior:**
+
+| `--eval-repeats` | What happens |
+|---|---|
+| `1` (default) | Single eval, identical to previous behavior |
+| `N > 1` | Server starts once, `lm_eval` runs N times. Each repeat gets its own log file (`lm_eval_output_r1.log`, `_r2.log`, ...). Per-repeat summary and Slack notification are sent. After all repeats, an aggregate summary (mean, std, range) is printed and sent to Slack. |
+
+**Output structure with `--eval-repeats 3`:**
+
+```
+results/<timestamp>_<config>/
+  server.log / prefiller.log / decoder.log / proxy.log   (shared)
+  lm_eval_output_r1.log
+  lm_eval_output_r2.log
+  lm_eval_output_r3.log
+  results.json              (contains all per-repeat scores + aggregate)
+```
+
+**`results.json` format with eval-repeats:**
+
+```json
+{
+  "config": { ... },
+  "eval_repeats": 3,
+  "repeats": [
+    { "repeat": 1, "score": 0.8432, "checks": [...], "all_passed": true },
+    { "repeat": 2, "score": 0.8401, "checks": [...], "all_passed": true },
+    { "repeat": 3, "score": 0.8464, "checks": [...], "all_passed": true }
+  ],
+  "aggregate": {
+    "scores": [0.8432, 0.8401, 0.8464],
+    "mean": 0.8432,
+    "std": 0.0032,
+    "min": 0.8401,
+    "max": 0.8464,
+    "n": 3
+  }
+}
+```
+
+**`sweep.py` interaction:**
+
+- `--server-repeats`: controls how many times vLLM servers are restarted per config/temp (seed incremented each time)
+- `--eval-repeats`: passed through to `run_lm_eval.py`, controls evals per server session
+
+Total evaluations = `configs × temps × server-repeats × eval-repeats`.
 
 ---
 
