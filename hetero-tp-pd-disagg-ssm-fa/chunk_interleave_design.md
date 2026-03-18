@@ -33,6 +33,9 @@ B_ratio = C_ratio = B_dim / g   — B/C-columns per chunk
 chunk_cols = x_ratio + B_ratio + C_ratio
 ```
 
+Here `x_dim` and `B_dim` are **P-local** dimensions (i.e. `intermediate_size / P_TP`
+and `groups_ss / P_TP`). For P TP=1 these equal the global model dimensions.
+
 Each chunk contains proportional slices of x, B, C. Since any valid TP
 divides both `x_dim` and `B_dim`, it also divides `g = gcd(x_dim, B_dim)`.
 Therefore every TP shard is an integer number of consecutive chunks.
@@ -75,7 +78,7 @@ chunk_bytes = 6 × 3 × 2 = 36 bytes
 TP=1:  1024 chunks = 36.0 KiB/block
 TP=2:   512 chunks = 18.0 KiB/block
 TP=4:   256 chunks =  9.0 KiB/block
-TP=8:   128 chunks =  7.5 KiB/block → always 1 contiguous read
+TP=8:   128 chunks =  4.5 KiB/block → always 1 contiguous read
 ```
 
 ## 3. Implementation
@@ -92,7 +95,20 @@ Build two permutation index tensors from model hyperparameters:
 Both are `torch.long` tensors on GPU. Size: `conv_rows × conv_dim × 8` bytes
 (~144 KiB for Nano TP=1, ~72 KiB for TP=2).
 
+Both P and D build both tensors, but **P only uses forward** and **D only uses
+inverse**. Each side computes dims from its own `local_tp`, so the inverse perm
+on D is built from D-local shard dimensions — no knowledge of P's TP is needed.
+
 ### 3.2 P-side (per request, in `start_load_kv`)
+
+Permutation is **gated on `tp_ratio != 1`** — skipped for homogeneous TP.
+The scheduler tracks which requests need permutation via
+`reqs_to_permute_blocks`, ensuring each request's blocks are permuted
+exactly once before D reads them.
+
+For HMA models, only mamba conv blocks are permuted (filtered via
+`_is_mamba_group`), and the loop runs over all unique underlying conv cache
+storages (`_mamba_conv_caches`):
 
 ```python
 selected = conv_cache.index_select(0, block_ids)   # copy blocks out
@@ -112,7 +128,20 @@ addr = base_addr + block_id * page_size + rank_offset
 `page_size` is the shared tensor's per-block stride (conv + SSM + padding).
 `rank_offset` selects the shard within the conv portion.
 
+**Key gotcha: `conv_cache` is a strided view.** The KV block manager
+allocates one large shared tensor per region containing conv state, SSM
+state, and padding. `conv_cache` is a PyTorch view that refers to the conv
+portion of each block, but the underlying memory stride between blocks is
+`page_size` (e.g. 2,138,112 B for Nano), not `conv_bytes` (e.g. 36,864 B).
+PyTorch's advanced indexing (`conv_cache[block_ids] = ...`) correctly
+respects this stride when writing back in-place, and the standard RDMA
+descriptor formula above works as-is — no special-casing needed for conv
+regions.
+
 ### 3.4 D-side (after transfer completes, in `get_finished`)
+
+Also **gated on `tp_ratio != 1`**. Only mamba conv block IDs are collected
+from `_is_mamba_group` before calling the inverse permutation:
 
 ```python
 selected = conv_cache.index_select(0, block_ids)
