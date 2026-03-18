@@ -45,19 +45,22 @@ Chunk-interleaved transposed: chunks laid out sequentially, each chunk's
 columns transposed to make `conv_rows` values per column contiguous.
 
 ```
-Original (conv_rows=3, x_ratio=4, B_ratio=1, C_ratio=1):
+Original layout (conv_rows=3, conv_dim = x_dim + B_dim + C_dim):
 
-  Row 0: [x0  x1  x2  x3  | B0  | C0  | x4  x5  x6  x7  | B1  | C1  | ...]
-  Row 1: [x0' x1' x2' x3' | B0' | C0' | x4' x5' x6' x7' | B1' | C1' | ...]
-  Row 2: [x0" x1" x2" x3" | B0" | C0" | x4" x5" x6" x7" | B1" | C1" | ...]
+  Row 0: [x0  x1  x2  x3  x4  x5  x6  x7  | B0  B1  | C0  C1 ]
+  Row 1: [x0' x1' x2' x3' x4' x5' x6' x7' | B0' B1' | C0' C1']
+  Row 2: [x0" x1" x2" x3" x4" x5" x6" x7" | B0" B1" | C0" C1"]
+          ◄──────── x_dim = 8 ──────────────►◄─ B=2 ──►◄─ C=2 ──►
 
-Chunk-interleaved transposed (flat):
+  All x columns first, then all B, then all C.
+  A TP=2 shard needs [x0..x3 | B0 | C0] — NOT contiguous.
+
+Chunk-interleaved transposed (flat, x_ratio=4, B_ratio=1, C_ratio=1):
 
   Chunk 0: [x0 x0' x0" | x1 x1' x1" | x2 x2' x2" | x3 x3' x3" | B0 B0' B0" | C0 C0' C0"]
   Chunk 1: [x4 x4' x4" | x5 x5' x5" | x6 x6' x6" | x7 x7' x7" | B1 B1' B1" | C1 C1' C1"]
-  ...
 
-  TP=2: ◄── rank 0: chunks 0..511 ──►◄── rank 1: chunks 512..1023 ──►
+  TP=2: ◄──── rank 0: chunk 0 ────►◄──── rank 1: chunk 1 ────►
         each is 1 contiguous RDMA read
 ```
 
