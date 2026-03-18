@@ -44,8 +44,7 @@ Therefore every TP shard is an integer number of consecutive chunks.
 
 Original: `(conv_rows, conv_dim)` — row-major, components concatenated.
 
-Chunk-interleaved transposed: chunks laid out sequentially, each chunk's
-columns transposed to make `conv_rows` values per column contiguous.
+The transformation has two conceptual steps: **grouping** then **transpose**.
 
 ```
 Original layout (conv_rows=3, conv_dim = x_dim + B_dim + C_dim):
@@ -58,13 +57,25 @@ Original layout (conv_rows=3, conv_dim = x_dim + B_dim + C_dim):
   All x columns first, then all B, then all C.
   A TP=2 shard needs [x0..x3 | B0 | C0] — NOT contiguous.
 
-Chunk-interleaved transposed (flat, x_ratio=4, B_ratio=1, C_ratio=1):
+Step 1 — Grouped (columns rearranged, still row-major):
 
-  Chunk 0: [x0 x0' x0" | x1 x1' x1" | x2 x2' x2" | x3 x3' x3" | B0 B0' B0" | C0 C0' C0"]
-  Chunk 1: [x4 x4' x4" | x5 x5' x5" | x6 x6' x6" | x7 x7' x7" | B1 B1' B1" | C1 C1' C1"]
+  Row 0: [x0  x1  x2  x3  | B0 | C0 ‖ x4  x5  x6  x7  | B1 | C1]
+  Row 1: [x0' x1' x2' x3' | B0'| C0'‖ x4' x5' x6' x7' | B1'| C1']
+  Row 2: [x0" x1" x2" x3" | B0"| C0"‖ x4" x5" x6" x7" | B1"| C1"]
+          ◄──── chunk 0 ──────────►  ◄──── chunk 1 ──────────►
 
-  TP=2: ◄──── rank 0: chunk 0 ────►◄──── rank 1: chunk 1 ────►
-        each is 1 contiguous RDMA read
+  TP=2 shards are now grouped, but NOT contiguous in flat memory
+  (row-major means row 0 of chunk 0 is far from row 1 of chunk 0).
+
+Step 2 — Transposed (each chunk flattened column-first):
+
+  ┌─ chunk 0 ──────────────────────────────────────────────────────────────┐
+  │ x0 x0' x0" │ x1 x1' x1" │ x2 x2' x2" │ x3 x3' x3" │ B0 B0' B0" │ C0 C0' C0" │
+  ├─ chunk 1 ──────────────────────────────────────────────────────────────┤
+  │ x4 x4' x4" │ x5 x5' x5" │ x6 x6' x6" │ x7 x7' x7" │ B1 B1' B1" │ C1 C1' C1" │
+  └────────────────────────────────────────────────────────────────────────┘
+
+  TP=2 → rank 0 reads chunk 0, rank 1 reads chunk 1 (1 contiguous read each)
 ```
 
 ### 2.3 Concrete Numbers (Nemotron-Nano-30B-A3B)
