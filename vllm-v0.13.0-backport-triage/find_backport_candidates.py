@@ -598,9 +598,12 @@ def phase4_blame(candidates):
     candidates.sort(key=lambda r: (-float(r["blame_score"].rstrip("%")) / 100, -r["priority"]))
     write_csv(candidates, OUTPUT_PHASE4, PHASE4_COLUMNS)
 
-    high = [r for r in candidates if float(r["blame_score"].rstrip("%")) >= 80]
-    med = [r for r in candidates if 40 <= float(r["blame_score"].rstrip("%")) < 80]
-    low = [r for r in candidates if float(r["blame_score"].rstrip("%")) < 40]
+    def _score(r):
+        return float(r["blame_score"].rstrip("%"))
+
+    high = [r for r in candidates if _score(r) >= 80]
+    med = [r for r in candidates if 0 < _score(r) < 80]
+    low = [r for r in candidates if _score(r) == 0]
 
     def _print_group(label, rows):
         print(f"\n  {'=' * 90}")
@@ -617,15 +620,15 @@ def phase4_blame(candidates):
             )
 
     _print_group(f"HIGH CONFIDENCE ({len(high)} PRs, >= 80% lines in {TAG})", high)
-    _print_group(f"MEDIUM CONFIDENCE ({len(med)} PRs, 40-79%)", med)
-    _print_group(f"LOW CONFIDENCE ({len(low)} PRs, < 40% — likely post-release code)", low)
+    _print_group(f"MEDIUM CONFIDENCE ({len(med)} PRs, 1-79% — partially applicable)", med)
+    _print_group(f"LOW CONFIDENCE ({len(low)} PRs, 0% — likely post-release code)", low)
 
     print(f"\n{'=' * 70}")
     print(f"  FINAL SUMMARY")
     print(f"  Candidates analyzed: {len(candidates)}")
     print(f"    High confidence:   {len(high)}  (bug exists in {TAG})")
     print(f"    Medium:            {len(med)}  (partially applicable)")
-    print(f"    Low:               {len(low)}  (likely post-release)")
+    print(f"    Low:               {len(low)}  (0% — likely post-release)")
     print(f"{'=' * 70}")
 
 
