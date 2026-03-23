@@ -166,11 +166,28 @@ def compute_priority(pr_type, files_in_release, files_total, subsystems):
     return min(score, 100)
 
 
-def write_csv(rows, path):
+PHASE3_COLUMNS = [
+    "priority", "pr", "title", "subsystems", "approvers", "merged_by",
+    "verdict", "skip_reason", "type", "merged_at", "author", "reviewers",
+    "labels", "additions", "deletions", "files_in_release", "files_total",
+    "files_existing", "files_new", "merge_sha", "url",
+]
+
+PHASE4_COLUMNS = [
+    "blame_score", "blame_detail", "priority", "pr", "title", "subsystems",
+    "approvers", "merged_by", "merged_at", "type", "verdict", "skip_reason",
+    "author", "reviewers", "labels", "additions", "deletions",
+    "files_in_release", "files_total", "files_existing", "files_new",
+    "merge_sha", "url",
+]
+
+
+def write_csv(rows, path, columns=None):
     if not rows:
         return
+    fieldnames = columns or list(rows[0].keys())
     with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
     print(f"  Saved: {path}")
@@ -422,7 +439,7 @@ def phase3_file_filter(prs):
             skipped.append(row)
 
     candidates.sort(key=lambda r: -r["priority"])
-    write_csv(candidates + skipped, OUTPUT_PHASE3)
+    write_csv(candidates + skipped, OUTPUT_PHASE3, PHASE3_COLUMNS)
 
     # Summary
     sub_counts: dict[str, int] = {}
@@ -579,7 +596,7 @@ def phase4_blame(candidates):
         row["blame_detail"] = detail
 
     candidates.sort(key=lambda r: (-float(r["blame_score"].rstrip("%")) / 100, -r["priority"]))
-    write_csv(candidates, OUTPUT_PHASE4)
+    write_csv(candidates, OUTPUT_PHASE4, PHASE4_COLUMNS)
 
     high = [r for r in candidates if float(r["blame_score"].rstrip("%")) >= 80]
     med = [r for r in candidates if 40 <= float(r["blame_score"].rstrip("%")) < 80]
