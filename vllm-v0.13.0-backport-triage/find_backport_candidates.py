@@ -32,6 +32,7 @@ OUTPUT_PHASE2 = OUTPUT_DIR / f"phase2_all_prs_{TAG}.csv"
 OUTPUT_PHASE3 = OUTPUT_DIR / f"phase3_candidates_{TAG}.csv"
 OUTPUT_PHASE4 = OUTPUT_DIR / f"phase4_blame_{TAG}.csv"
 OUTPUT_LOG = OUTPUT_DIR / f"triage_{TAG}.log"
+PLATFORM_CSV_PREFIX = OUTPUT_DIR / f"platform"
 
 # ── Classification rules ─────────────────────────────────────────────
 
@@ -168,14 +169,22 @@ def compute_priority(pr_type, files_in_release, files_total, subsystems):
 
 PHASE3_COLUMNS = [
     "priority", "pr", "title", "subsystems", "approvers", "merged_by",
-    "verdict", "skip_reason", "type", "merged_at", "author", "reviewers",
-    "labels", "additions", "deletions", "files_in_release", "files_total",
-    "files_existing", "files_new", "merge_sha", "url",
+    "reverted_by", "verdict", "skip_reason", "type", "merged_at", "author",
+    "reviewers", "labels", "additions", "deletions", "files_in_release",
+    "files_total", "files_existing", "files_new", "merge_sha", "url",
 ]
 
 PHASE4_COLUMNS = [
     "blame_score", "blame_detail", "priority", "pr", "title", "subsystems",
-    "approvers", "merged_by", "merged_at", "type", "verdict", "skip_reason",
+    "approvers", "merged_by", "reverted_by", "merged_at", "type", "verdict",
+    "skip_reason", "author", "reviewers", "labels", "additions", "deletions",
+    "files_in_release", "files_total", "files_existing", "files_new",
+    "merge_sha", "url",
+]
+
+PLATFORM_COLUMNS = [
+    "priority", "pr", "title", "platform", "subsystems", "approvers",
+    "merged_by", "reverted_by", "verdict", "skip_reason", "type", "merged_at",
     "author", "reviewers", "labels", "additions", "deletions",
     "files_in_release", "files_total", "files_existing", "files_new",
     "merge_sha", "url",
@@ -289,6 +298,24 @@ def fetch_all_pr_details(pr_numbers, batch_size=30):
     return all_details
 
 
+def fetch_revert_map(tag_date):
+    """Fetch all 'Revert' PRs merged after tag_date.
+    Returns {original_pr_number: revert_pr_number}."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    search = f'merged:{tag_date}..{today} "Revert" in:title'
+    raw = run([
+        "gh", "pr", "list", "--repo", REPO, "--state", "merged",
+        "--limit", "1000", "--search", search,
+        "--json", "number,title",
+    ])
+    reverts = json.loads(raw) if raw else []
+    revert_map = {}
+    for r in reverts:
+        for m in re.finditer(r"#(\d+)", r["title"]):
+            revert_map[int(m.group(1))] = r["number"]
+    return revert_map
+
+
 # ── Phase 1: Fetch ───────────────────────────────────────────────────
 
 def phase1_fetch(tag_date):
@@ -297,13 +324,18 @@ def phase1_fetch(tag_date):
     print(f"{'=' * 70}")
 
     prs = fetch_all_bugfix_prs(tag_date)
-    print(f"\n  Total merged bugfix PRs after {TAG}: {len(prs)}\n")
-    return prs
+    print(f"\n  Total merged bugfix PRs after {TAG}: {len(prs)}")
+
+    print(f"\n  Fetching revert PRs...")
+    revert_map = fetch_revert_map(tag_date)
+    print(f"  Found {len(revert_map)} reverted PRs\n")
+
+    return prs, revert_map
 
 
 # ── Phase 2: Classify ────────────────────────────────────────────────
 
-def phase2_classify(prs):
+def phase2_classify(prs, revert_map):
     print(f"{'=' * 70}")
     print(f"  PHASE 2: Quick classification ({len(prs)} PRs)")
     print(f"{'=' * 70}\n")
@@ -319,13 +351,15 @@ def phase2_classify(prs):
         label_names = [l.get("name", "") for l in (pr.get("labels") or [])]
         author = (pr.get("author") or {}).get("login", "")
         merged_by = (pr.get("mergedBy") or {}).get("login", "")
+        reverted = revert_map.get(num)
 
         pr_type = classify_pr_type(title, label_names)
         counts[pr_type] += 1
 
         marker = {"runtime_bug": "BUG", "not_bugfix": "-- ",
                    "platform_specific": "plt", "unclear": "?  "}[pr_type]
-        print(f"  [{marker}] #{num:<7} {merged}  merged_by:@{merged_by:<16} {title[:50]}")
+        rev_tag = f" ⚠️ REVERTED by #{reverted}" if reverted else ""
+        print(f"  [{marker}] #{num:<7} {merged}  merged_by:@{merged_by:<16} {title[:50]}{rev_tag}")
 
         skip_reasons = {
             "not_bugfix": "not a bugfix (Feature/Perf/CI/Refactor)",
@@ -334,6 +368,7 @@ def phase2_classify(prs):
         rows.append({
             "pr": f"#{num}", "title": title, "type": pr_type,
             "skip_reason": skip_reasons.get(pr_type, ""),
+            "reverted_by": f"#{reverted}" if reverted else "",
             "author": author, "merged_by": merged_by,
             "merged_at": merged, "labels": ", ".join(label_names),
             "merge_sha": sha, "url": f"https://github.com/{REPO}/pull/{num}",
@@ -341,20 +376,79 @@ def phase2_classify(prs):
 
     write_csv(rows, OUTPUT_PHASE2)
 
-    rt, uc = counts['runtime_bug'], counts['unclear']
+    rt, uc, pt = counts['runtime_bug'], counts['unclear'], counts['platform_specific']
     print(f"\n  Classification:")
     print(f"    runtime_bug:       {rt:>4}  (confirmed bugfixes)")
     print(f"    unclear:           {uc:>4}  ('fix' in title, needs review)")
     print(f"    not_bugfix:        {counts['not_bugfix']:>4}  (Feature/Perf/CI/Refactor)")
-    print(f"    platform_specific: {counts['platform_specific']:>4}  (not relevant to NVIDIA)")
-    print(f"\n  Phase 3 will process: {rt + uc} PRs\n")
+    print(f"    platform_specific: {pt:>4}  (separate CSVs per platform)")
+    print(f"\n  Phase 3 will process: {rt + uc} NVIDIA PRs + {pt} platform PRs\n")
 
-    return prs
+    return prs, revert_map
 
 
 # ── Phase 3: File-level filter ───────────────────────────────────────
 
-def phase3_file_filter(prs):
+def _detect_platform(label_names):
+    """Return the matching platform tag(s) for a PR, or empty string."""
+    platforms = []
+    for tag in PLATFORM_SKIP_TAGS:
+        if tag in {l.lower() for l in label_names}:
+            platforms.append(tag)
+    return platforms
+
+
+def _build_row(pr, label_map, all_details, file_results, revert_map, platform=None):
+    """Build a row dict for a PR. Shared by NVIDIA and platform processing."""
+    num = pr["number"]
+    title = pr["title"]
+    merged = (pr.get("mergedAt") or "")[:10]
+    sha = (pr.get("mergeCommit") or {}).get("oid", "")
+    labels = label_map[num]
+    author = (pr.get("author") or {}).get("login", "")
+    detail = all_details.get(num, {})
+    files, in_release, new_files = file_results[num]
+    runtime_only = [f for f in in_release if not is_non_runtime_file(f)]
+
+    pr_type = classify_pr_type(title, labels)
+    subsystems = detect_subsystems(files)
+    priority = compute_priority(pr_type, len(in_release), len(files), subsystems)
+    merged_by = detail.get("merged_by", "")
+    reviewers = detail.get("reviewers", [])
+    approvers = detail.get("approvers", [])
+    reverted = revert_map.get(num)
+
+    if not files:
+        verdict, skip_reason = "SKIP", "no files detected"
+    elif not in_release:
+        verdict, skip_reason = "SKIP", "all files are post-release"
+    elif not runtime_only:
+        verdict, skip_reason = "SKIP", "only touches tests/docs/CI files"
+    else:
+        verdict, skip_reason = "CANDIDATE", ""
+
+    row = {
+        "priority": priority, "verdict": verdict, "skip_reason": skip_reason,
+        "type": pr_type, "pr": f"#{num}", "title": title,
+        "author": author, "merged_by": merged_by,
+        "approvers": "; ".join(approvers),
+        "reverted_by": f"#{reverted}" if reverted else "",
+        "reviewers": "; ".join(reviewers),
+        "subsystems": ", ".join(sorted(subsystems)),
+        "merged_at": merged, "labels": ", ".join(labels),
+        "additions": detail.get("additions", 0),
+        "deletions": detail.get("deletions", 0),
+        "files_in_release": len(in_release), "files_total": len(files),
+        "files_existing": " | ".join(in_release),
+        "files_new": " | ".join(new_files),
+        "merge_sha": sha, "url": f"https://github.com/{REPO}/pull/{num}",
+    }
+    if platform:
+        row["platform"] = platform
+    return row
+
+
+def phase3_file_filter(prs, revert_map):
     print(f"{'=' * 70}")
     print(f"  PHASE 3: File-level filter against {TAG}")
     print(f"{'=' * 70}\n")
@@ -363,15 +457,20 @@ def phase3_file_filter(prs):
     for pr in prs:
         label_map[pr["number"]] = [l.get("name", "") for l in (pr.get("labels") or [])]
 
-    worth_checking = [
+    nvidia_prs = [
         pr for pr in prs
         if classify_pr_type(pr["title"], label_map[pr["number"]]) in ("runtime_bug", "unclear")
     ]
-    skipped_early = len(prs) - len(worth_checking)
+    platform_prs = [
+        pr for pr in prs
+        if classify_pr_type(pr["title"], label_map[pr["number"]]) == "platform_specific"
+    ]
+    skipped_early = len(prs) - len(nvidia_prs) - len(platform_prs)
     print(f"  Skipping {skipped_early} non-bugfix PRs")
-    print(f"  Checking {len(worth_checking)} PRs\n")
+    print(f"  Checking {len(nvidia_prs)} NVIDIA PRs + {len(platform_prs)} platform PRs\n")
 
-    pr_numbers = [pr["number"] for pr in worth_checking]
+    all_to_check = nvidia_prs + platform_prs
+    pr_numbers = [pr["number"] for pr in all_to_check]
     print(f"  Fetching details via GraphQL...")
     all_details = fetch_all_pr_details(pr_numbers)
 
@@ -382,58 +481,17 @@ def phase3_file_filter(prs):
             d = all_details.get(pr["number"], {})
             files = d.get("files", [])
             return pr["number"], files, [f for f in files if file_exists_at_tag(f)], [f for f in files if not file_exists_at_tag(f)]
-        futures = {pool.submit(_check, pr): pr for pr in worth_checking}
+        futures = {pool.submit(_check, pr): pr for pr in all_to_check}
         for future in as_completed(futures):
             num, files, in_rel, new_f = future.result()
             file_results[num] = (files, in_rel, new_f)
 
+    # --- NVIDIA candidates ---
     candidates = []
     skipped = []
-
-    for pr in worth_checking:
-        num = pr["number"]
-        title = pr["title"]
-        merged = (pr.get("mergedAt") or "")[:10]
-        sha = (pr.get("mergeCommit") or {}).get("oid", "")
-        labels = label_map[num]
-        author = (pr.get("author") or {}).get("login", "")
-        detail = all_details.get(num, {})
-        files, in_release, new_files = file_results[num]
-        runtime_only = [f for f in in_release if not is_non_runtime_file(f)]
-
-        pr_type = classify_pr_type(title, labels)
-        subsystems = detect_subsystems(files)
-        priority = compute_priority(pr_type, len(in_release), len(files), subsystems)
-        merged_by = detail.get("merged_by", "")
-        reviewers = detail.get("reviewers", [])
-        approvers = detail.get("approvers", [])
-
-        if not files:
-            verdict, skip_reason = "SKIP", "no files detected"
-        elif not in_release:
-            verdict, skip_reason = "SKIP", "all files are post-release"
-        elif not runtime_only:
-            verdict, skip_reason = "SKIP", "only touches tests/docs/CI files"
-        else:
-            verdict, skip_reason = "CANDIDATE", ""
-
-        row = {
-            "priority": priority, "verdict": verdict, "skip_reason": skip_reason,
-            "type": pr_type, "pr": f"#{num}", "title": title,
-            "author": author, "merged_by": merged_by,
-            "approvers": "; ".join(approvers),
-            "reviewers": "; ".join(reviewers),
-            "subsystems": ", ".join(sorted(subsystems)),
-            "merged_at": merged, "labels": ", ".join(labels),
-            "additions": detail.get("additions", 0),
-            "deletions": detail.get("deletions", 0),
-            "files_in_release": len(in_release), "files_total": len(files),
-            "files_existing": " | ".join(in_release),
-            "files_new": " | ".join(new_files),
-            "merge_sha": sha, "url": f"https://github.com/{REPO}/pull/{num}",
-        }
-
-        if verdict == "CANDIDATE":
+    for pr in nvidia_prs:
+        row = _build_row(pr, label_map, all_details, file_results, revert_map)
+        if row["verdict"] == "CANDIDATE":
             candidates.append(row)
         else:
             skipped.append(row)
@@ -441,18 +499,34 @@ def phase3_file_filter(prs):
     candidates.sort(key=lambda r: -r["priority"])
     write_csv(candidates + skipped, OUTPUT_PHASE3, PHASE3_COLUMNS)
 
-    # Summary
     sub_counts: dict[str, int] = {}
     for r in candidates:
         for s in r["subsystems"].split(", "):
             if s.strip():
                 sub_counts[s.strip()] = sub_counts.get(s.strip(), 0) + 1
 
-    print(f"\n  Phase 3 results: {len(candidates)} candidates, {len(skipped)} skipped")
+    print(f"\n  NVIDIA results: {len(candidates)} candidates, {len(skipped)} skipped")
     if sub_counts:
         print(f"\n  Subsystem breakdown:")
         for name, count in sorted(sub_counts.items(), key=lambda x: -x[1]):
             print(f"    {name:<20} {count:>4}")
+
+    # --- Platform CSVs ---
+    platform_rows: dict[str, list] = {}
+    for pr in platform_prs:
+        platforms = _detect_platform(label_map[pr["number"]])
+        for plat in platforms:
+            row = _build_row(pr, label_map, all_details, file_results, revert_map, platform=plat)
+            platform_rows.setdefault(plat, []).append(row)
+
+    print(f"\n  Platform-specific PRs:")
+    for plat in sorted(platform_rows):
+        rows = platform_rows[plat]
+        plat_candidates = [r for r in rows if r["verdict"] == "CANDIDATE"]
+        rows.sort(key=lambda r: -r["priority"])
+        out_path = OUTPUT_DIR / f"platform_{plat}_{TAG}.csv"
+        write_csv(rows, out_path, PLATFORM_COLUMNS)
+        print(f"    {plat:<12} {len(plat_candidates):>3} candidates / {len(rows)} total")
     print()
 
     return candidates
@@ -643,9 +717,9 @@ def main():
     print(f"Run time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Log file: {OUTPUT_LOG}\n")
 
-    prs = phase1_fetch(tag_date)
-    prs = phase2_classify(prs)
-    candidates = phase3_file_filter(prs)
+    prs, revert_map = phase1_fetch(tag_date)
+    prs, revert_map = phase2_classify(prs, revert_map)
+    candidates = phase3_file_filter(prs, revert_map)
     phase4_blame(candidates)
 
     tee.close()

@@ -12,7 +12,7 @@ Single script, four phases, each saving an intermediate CSV:
 
 ### Phase 1 — Fetch
 
-Queries GitHub for all merged PRs matching bugfix patterns (`label:bug`, `[Bugfix]`/`[BugFix]` in title). Uses 7-day date windows to avoid GitHub's 1,000-result API limit.
+Queries GitHub for all merged PRs matching bugfix patterns (`label:bug`, `[Bugfix]`/`[BugFix]` in title). Uses 7-day date windows to avoid GitHub's 1,000-result API limit. Also fetches all "Revert" PRs to detect reverted bugfixes.
 
 ### Phase 2 — Classify → `phase2_all_prs_v0.13.0.csv`
 
@@ -20,24 +20,32 @@ Quick-classifies each PR:
 
 | Type | Criteria | Action |
 |------|----------|--------|
-| `runtime_bug` | Has `bug` label, or title matches `[Bugfix]`/`[BugFix]`/`[Fix]` | Proceed to Phase 3 |
-| `unclear` | Has "fix" in title but no clear prefix | Proceed to Phase 3 |
+| `runtime_bug` | Has `bug` label, or title matches `[Bugfix]`/`[BugFix]`/`[Fix]` | Proceed to Phase 3 (NVIDIA) |
+| `unclear` | Has "fix" in title but no clear prefix | Proceed to Phase 3 (NVIDIA) |
 | `not_bugfix` | Title starts with `[Feature]`, `[Perf]`, `[CI]`, `[Refactor]`, etc. | Skip |
-| `platform_specific` | Has `rocm`/`tpu`/`cpu`/`xpu` label | Skip (NVIDIA-only) |
+| `platform_specific` | Has `rocm`/`tpu`/`cpu`/`xpu` label | Phase 3 (separate platform CSVs) |
 
-### Phase 3 — File-Level Filter → `phase3_candidates_v0.13.0.csv`
+PRs that were later reverted are flagged with `reverted_by`.
 
-For each `runtime_bug`/`unclear` PR:
+### Phase 3 — File-Level Filter
+
+Processes both NVIDIA and platform-specific PRs:
+
+**NVIDIA** → `phase3_candidates_v0.13.0.csv`:
 - Fetches files, approvers, reviewers, merger, line counts (batched GraphQL)
 - Checks if each file existed at the `v0.13.0` tag
 - Detects subsystem (attention, engine, models, etc.)
 - Assigns a priority score (0-100)
 
+**Platform-specific** → `platform_{rocm,tpu,cpu,xpu,intel-gpu}_v0.13.0.csv`:
+- Same file-level filter applied per platform
+- One CSV per platform for independent review
+
 Priority scoring: `runtime_bug`=+40, file coverage up to +30, core subsystem +20, models/quant +10.
 
 ### Phase 4 — Blame-Level Filter → `phase4_blame_v0.13.0.csv`
 
-For each Phase 3 candidate:
+For each Phase 3 NVIDIA candidate:
 - Parses the merge commit diff to find modified line numbers
 - Runs `git blame` at the **parent commit** (`merge_sha~1`) for each modified line
 - Checks if the commit that introduced each line predates the v0.13.0 tag date
@@ -47,8 +55,8 @@ This avoids line-number-drift issues (where lines shift between the tag and the 
 
 Groups results by confidence:
 - **High** (≥80%): bug very likely exists in v0.13.0
-- **Medium** (40-79%): partially applicable
-- **Low** (<40%): likely fixes code introduced after v0.13.0
+- **Medium** (1-79%): partially applicable
+- **Low** (0%): likely fixes code introduced after v0.13.0
 
 ## Usage
 
@@ -64,24 +72,32 @@ Prerequisites: `gh` (GitHub CLI, authenticated), `git`, Python 3.10+, inside a v
 ### Output Files
 
 ```
-phase2_all_prs_v0.13.0.csv       — All PRs with classification
-phase3_candidates_v0.13.0.csv    — Filtered candidates with priority, subsystem, approvers
-phase4_blame_v0.13.0.csv         — Final results with blame score per PR
-triage_v0.13.0.log               — Full readable log
+phase2_all_prs_v0.13.0.csv           — All PRs with classification
+phase3_candidates_v0.13.0.csv        — NVIDIA candidates with priority, subsystem, approvers
+phase4_blame_v0.13.0.csv             — Final NVIDIA results with blame score per PR
+platform_rocm_v0.13.0.csv            — ROCm-specific bugfixes
+platform_tpu_v0.13.0.csv             — TPU-specific bugfixes
+platform_cpu_v0.13.0.csv             — CPU-specific bugfixes
+platform_xpu_v0.13.0.csv             — XPU-specific bugfixes
+platform_intel-gpu_v0.13.0.csv       — Intel GPU-specific bugfixes
+triage_v0.13.0.log                   — Full readable log
 ```
 
-### CSV Columns (Phase 3/4)
+### Key CSV Columns
 
-`priority`, `verdict`, `skip_reason`, `type`, `pr`, `title`, `author`, `merged_by`, `approvers`, `reviewers`, `subsystems`, `merged_at`, `labels`, `additions`, `deletions`, `files_in_release`, `files_total`, `files_existing`, `files_new`, `merge_sha`, `url`
+Phase 3: `priority`, `pr`, `title`, `subsystems`, `approvers`, `merged_by`, `reverted_by`, `verdict`, ...
 
 Phase 4 adds: `blame_score`, `blame_detail`
+
+Platform CSVs add: `platform`
 
 ## Next Steps
 
 1. Review the Phase 4 CSV — filter by blame score, subsystem, and priority
-2. Scope to RHAI's actual deployment (which models, features, quantization methods)
-3. Create a GitHub milestone for confirmed backports
-4. Use vLLM's built-in cherry-pick script: `.buildkite/scripts/cherry-pick-from-milestone.sh`
+2. Check `reverted_by` column — skip PRs that were later reverted
+3. Scope to RHAI's actual deployment (which models, features, quantization methods)
+4. Create a GitHub milestone for confirmed backports
+5. Use vLLM's built-in cherry-pick script: `.buildkite/scripts/cherry-pick-from-milestone.sh`
 
 ## Claude Suggested Further Filtering Strategies
 
