@@ -2,12 +2,13 @@
 """
 Find bugfix PRs merged after vLLM v0.13.0 that are candidates for backporting.
 
-Three phases:
+Four phases:
   1. Fetch all merged bugfix PRs after the release date
   2. Quick-classify each PR (runtime_bug / not_bugfix / platform / unclear)
   3. File-level filter: check which PRs touch files that existed in v0.13.0
+  4. Blame-level filter: check which specific lines existed in v0.13.0
 
-Intermediate CSVs are saved after phases 2 and 3.
+Intermediate CSVs are saved after phases 2, 3, and 4.
 
 Prerequisites: gh (GitHub CLI, authenticated), git, Python 3.10+, inside vllm repo.
 Usage: python find_backport_candidates.py
@@ -29,6 +30,7 @@ WORKERS = 10
 OUTPUT_DIR = Path(__file__).parent
 OUTPUT_PHASE2 = OUTPUT_DIR / f"phase2_all_prs_{TAG}.csv"
 OUTPUT_PHASE3 = OUTPUT_DIR / f"phase3_candidates_{TAG}.csv"
+OUTPUT_PHASE4 = OUTPUT_DIR / f"phase4_blame_{TAG}.csv"
 OUTPUT_LOG = OUTPUT_DIR / f"triage_{TAG}.log"
 
 # ── Classification rules ─────────────────────────────────────────────
@@ -225,7 +227,7 @@ def _graphql_batch_details(pr_numbers):
       additions deletions
       mergedBy {{ login }}
       files(first: 100) {{ nodes {{ path }} }}
-      reviews(first: 50) {{ nodes {{ author {{ login }} }} }}
+      reviews(first: 50) {{ nodes {{ author {{ login }} state }} }}
     }}""")
     query = f"""{{ repository(owner: "{OWNER}", name: "{REPO_NAME}") {{ {"".join(fragments)} }} }}"""
     raw = run(["gh", "api", "graphql", "-f", f"query={query}"], check=False)
@@ -236,18 +238,24 @@ def _graphql_batch_details(pr_numbers):
     for num in pr_numbers:
         pr_data = data.get(f"pr_{num}")
         if not pr_data:
-            results[num] = {"files": [], "reviewers": [], "merged_by": "", "additions": 0, "deletions": 0}
+            results[num] = {"files": [], "reviewers": [], "approvers": [],
+                            "merged_by": "", "additions": 0, "deletions": 0}
             continue
         files = [n["path"] for n in (pr_data.get("files", {}).get("nodes") or [])]
-        seen = set()
-        reviewers = []
+        seen_rev, seen_app = set(), set()
+        reviewers, approvers = [], []
         for r in (pr_data.get("reviews", {}).get("nodes") or []):
             login = (r.get("author") or {}).get("login", "")
-            if login and login not in seen:
-                seen.add(login)
+            if not login:
+                continue
+            if login not in seen_rev:
+                seen_rev.add(login)
                 reviewers.append(login)
+            if r.get("state") == "APPROVED" and login not in seen_app:
+                seen_app.add(login)
+                approvers.append(login)
         results[num] = {
-            "files": files, "reviewers": reviewers,
+            "files": files, "reviewers": reviewers, "approvers": approvers,
             "merged_by": (pr_data.get("mergedBy") or {}).get("login", ""),
             "additions": pr_data.get("additions", 0),
             "deletions": pr_data.get("deletions", 0),
@@ -381,6 +389,7 @@ def phase3_file_filter(prs):
         priority = compute_priority(pr_type, len(in_release), len(files), subsystems)
         merged_by = detail.get("merged_by", "")
         reviewers = detail.get("reviewers", [])
+        approvers = detail.get("approvers", [])
 
         if not files:
             verdict, skip_reason = "SKIP", "no files detected"
@@ -395,6 +404,7 @@ def phase3_file_filter(prs):
             "priority": priority, "verdict": verdict, "skip_reason": skip_reason,
             "type": pr_type, "pr": f"#{num}", "title": title,
             "author": author, "merged_by": merged_by,
+            "approvers": "; ".join(approvers),
             "reviewers": "; ".join(reviewers),
             "subsystems": ", ".join(sorted(subsystems)),
             "merged_at": merged, "labels": ", ".join(labels),
@@ -431,6 +441,177 @@ def phase3_file_filter(prs):
     return candidates
 
 
+# ── Blame helpers ────────────────────────────────────────────────────
+
+_TAG_EPOCH = None  # lazily resolved to int timestamp of TAG
+
+def _get_tag_epoch():
+    global _TAG_EPOCH
+    if _TAG_EPOCH is None:
+        ts = run(["git", "log", "--format=%ct", TAG, "-1"])
+        _TAG_EPOCH = int(ts)
+    return _TAG_EPOCH
+
+
+def _get_diff_line_map(merge_sha):
+    """Parse diff of a merge commit → {filepath: [line_numbers_in_parent]}."""
+    try:
+        diff = run(["git", "diff", f"{merge_sha}~1..{merge_sha}", "--unified=0"], check=False)
+    except Exception:
+        return {}
+    if not diff:
+        return {}
+    result = {}
+    current_file = None
+    for line in diff.split("\n"):
+        if line.startswith("--- a/"):
+            current_file = line[6:]
+        elif line.startswith("+++ b/"):
+            current_file = line[6:]
+        elif line.startswith("@@ ") and current_file:
+            match = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+            if match:
+                old_start = int(match.group(1))
+                old_count = int(match.group(2) or 1)
+                if current_file not in result:
+                    result[current_file] = []
+                result[current_file].extend(range(old_start, old_start + old_count))
+    return result
+
+
+def _blame_at_parent(merge_sha, filepath, line_numbers):
+    """
+    Blame at merge_sha~1 (the parent) for the given lines.
+    For each line, check if the commit that introduced it predates TAG.
+    Returns (matched_count, total_count).
+    """
+    if not line_numbers:
+        return 0, 0
+    tag_epoch = _get_tag_epoch()
+    try:
+        blame_raw = run(
+            ["git", "blame", "--porcelain", f"{merge_sha}~1", "--", filepath],
+            check=True,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return 0, len(line_numbers)
+
+    line_set = set(line_numbers)
+    commit_for_line = {}
+    commit_time = {}
+    current_sha = None
+    current_orig_line = None
+
+    for bline in blame_raw.split("\n"):
+        parts = bline.split()
+        if (len(parts) >= 3 and len(parts[0]) == 40
+                and all(c in "0123456789abcdef" for c in parts[0])):
+            current_sha = parts[0]
+            current_orig_line = int(parts[2])
+            if current_orig_line in line_set:
+                commit_for_line[current_orig_line] = current_sha
+        elif bline.startswith("committer-time ") and current_sha:
+            commit_time[current_sha] = int(bline.split()[1])
+
+    matched = 0
+    for ln in line_numbers:
+        sha = commit_for_line.get(ln)
+        if sha and commit_time.get(sha, float("inf")) <= tag_epoch:
+            matched += 1
+    return matched, len(line_numbers)
+
+
+def compute_blame_score(merge_sha):
+    """
+    For a merge commit, compute what fraction of modified lines
+    were introduced on or before TAG (i.e., exist in v0.13.0).
+    """
+    diff_map = _get_diff_line_map(merge_sha)
+    if not diff_map:
+        return 0.0, "no diff"
+
+    total_matched = 0
+    total_lines = 0
+    for filepath, lines in diff_map.items():
+        if not file_exists_at_tag(filepath):
+            continue
+        matched, count = _blame_at_parent(merge_sha, filepath, lines)
+        total_matched += matched
+        total_lines += count
+
+    if total_lines == 0:
+        return 0.0, "no blameable lines"
+    score = total_matched / total_lines
+    return score, f"{total_matched}/{total_lines} lines pre-{TAG}"
+
+
+# ── Phase 4: Blame-level filter ──────────────────────────────────────
+
+def phase4_blame(candidates):
+    print(f"{'=' * 70}")
+    print(f"  PHASE 4: Blame-level filter — line-level precision")
+    print(f"  Checking {len(candidates)} candidates ({WORKERS} workers)")
+    print(f"{'=' * 70}\n")
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        def _blame(row):
+            sha = row.get("merge_sha", "")
+            if not sha:
+                return row["pr"], 0.0, "no merge SHA"
+            score, detail = compute_blame_score(sha)
+            return row["pr"], score, detail
+
+        futures = {pool.submit(_blame, row): row for row in candidates}
+        done = 0
+        for future in as_completed(futures):
+            pr, score, detail = future.result()
+            results[pr] = (score, detail)
+            done += 1
+            if done % 50 == 0:
+                print(f"  Progress: {done}/{len(candidates)}")
+
+    print(f"  Done: {len(results)} PRs analyzed\n")
+
+    for row in candidates:
+        score, detail = results.get(row["pr"], (0.0, "not analyzed"))
+        row["blame_score"] = f"{score:.0%}"
+        row["blame_detail"] = detail
+
+    candidates.sort(key=lambda r: (-float(r["blame_score"].rstrip("%")) / 100, -r["priority"]))
+    write_csv(candidates, OUTPUT_PHASE4)
+
+    high = [r for r in candidates if float(r["blame_score"].rstrip("%")) >= 80]
+    med = [r for r in candidates if 40 <= float(r["blame_score"].rstrip("%")) < 80]
+    low = [r for r in candidates if float(r["blame_score"].rstrip("%")) < 40]
+
+    def _print_group(label, rows):
+        print(f"\n  {'=' * 90}")
+        print(f"  {label}")
+        print(f"  {'=' * 90}")
+        for r in rows:
+            who = r.get("approvers") or r.get("merged_by") or ""
+            if ";" in who:
+                who = who.split(";")[0].strip()
+            print(
+                f"  {r['blame_score']:>4} [{r['priority']:>3}] {r['pr']:<8} "
+                f"[{r['subsystems']:<20}] @{who:<14} "
+                f"{r['title'][:40]}"
+            )
+
+    _print_group(f"HIGH CONFIDENCE ({len(high)} PRs, >= 80% lines in {TAG})", high)
+    _print_group(f"MEDIUM CONFIDENCE ({len(med)} PRs, 40-79%)", med)
+    _print_group(f"LOW CONFIDENCE ({len(low)} PRs, < 40% — likely post-release code)", low)
+
+    print(f"\n{'=' * 70}")
+    print(f"  FINAL SUMMARY")
+    print(f"  Candidates analyzed: {len(candidates)}")
+    print(f"    High confidence:   {len(high)}  (bug exists in {TAG})")
+    print(f"    Medium:            {len(med)}  (partially applicable)")
+    print(f"    Low:               {len(low)}  (likely post-release)")
+    print(f"{'=' * 70}")
+
+
 # ── Main ─────────────────────────────────────────────────────────────
 
 def main():
@@ -444,12 +625,13 @@ def main():
 
     prs = phase1_fetch(tag_date)
     prs = phase2_classify(prs)
-    phase3_file_filter(prs)
+    candidates = phase3_file_filter(prs)
+    phase4_blame(candidates)
 
     tee.close()
     sys.stdout = tee.stdout
     print(f"\nFull output saved to: {OUTPUT_LOG}")
-    print(f"CSVs: {OUTPUT_PHASE2.name}, {OUTPUT_PHASE3.name}")
+    print(f"CSVs: {OUTPUT_PHASE2.name}, {OUTPUT_PHASE3.name}, {OUTPUT_PHASE4.name}")
 
 
 if __name__ == "__main__":

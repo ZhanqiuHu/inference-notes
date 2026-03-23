@@ -8,7 +8,7 @@ vLLM v0.13.0 was released 2025-12-18. Since then, thousands of PRs have been mer
 
 ## How It Works
 
-Single script, three phases, each saving an intermediate CSV:
+Single script, four phases, each saving an intermediate CSV:
 
 ### Phase 1 — Fetch
 
@@ -28,12 +28,27 @@ Quick-classifies each PR:
 ### Phase 3 — File-Level Filter → `phase3_candidates_v0.13.0.csv`
 
 For each `runtime_bug`/`unclear` PR:
-- Fetches files, reviewers, merger, line counts (batched GraphQL)
+- Fetches files, approvers, reviewers, merger, line counts (batched GraphQL)
 - Checks if each file existed at the `v0.13.0` tag
 - Detects subsystem (attention, engine, models, etc.)
 - Assigns a priority score (0-100)
 
 Priority scoring: `runtime_bug`=+40, file coverage up to +30, core subsystem +20, models/quant +10.
+
+### Phase 4 — Blame-Level Filter → `phase4_blame_v0.13.0.csv`
+
+For each Phase 3 candidate:
+- Parses the merge commit diff to find modified line numbers
+- Runs `git blame` at the **parent commit** (`merge_sha~1`) for each modified line
+- Checks if the commit that introduced each line predates the v0.13.0 tag date
+- Computes a `blame_score` (0-100%) representing the fraction of modified lines that existed in v0.13.0
+
+This avoids line-number-drift issues (where lines shift between the tag and the merge parent due to intervening commits).
+
+Groups results by confidence:
+- **High** (≥80%): bug very likely exists in v0.13.0
+- **Medium** (40-79%): partially applicable
+- **Low** (<40%): likely fixes code introduced after v0.13.0
 
 ## Usage
 
@@ -42,7 +57,7 @@ cd /path/to/vllm
 python find_backport_candidates.py
 ```
 
-No flags. Runs all three phases sequentially. All output goes to stdout + `triage_v0.13.0.log`.
+No flags. Runs all four phases sequentially. All output goes to stdout + `triage_v0.13.0.log`.
 
 Prerequisites: `gh` (GitHub CLI, authenticated), `git`, Python 3.10+, inside a vllm repo with `v0.13.0` tag.
 
@@ -50,25 +65,20 @@ Prerequisites: `gh` (GitHub CLI, authenticated), `git`, Python 3.10+, inside a v
 
 ```
 phase2_all_prs_v0.13.0.csv       — All PRs with classification
-phase3_candidates_v0.13.0.csv    — Filtered candidates with priority, subsystem, reviewers
+phase3_candidates_v0.13.0.csv    — Filtered candidates with priority, subsystem, approvers
+phase4_blame_v0.13.0.csv         — Final results with blame score per PR
 triage_v0.13.0.log               — Full readable log
 ```
 
-### CSV Columns (Phase 3)
+### CSV Columns (Phase 3/4)
 
-`priority`, `verdict`, `skip_reason`, `type`, `pr`, `title`, `author`, `merged_by`, `reviewers`, `subsystems`, `merged_at`, `labels`, `additions`, `deletions`, `files_in_release`, `files_total`, `files_existing`, `files_new`, `merge_sha`, `url`
+`priority`, `verdict`, `skip_reason`, `type`, `pr`, `title`, `author`, `merged_by`, `approvers`, `reviewers`, `subsystems`, `merged_at`, `labels`, `additions`, `deletions`, `files_in_release`, `files_total`, `files_existing`, `files_new`, `merge_sha`, `url`
 
-## Example Run Results (2026-03-23)
-
-- **646** PRs fetched
-- **129** skipped early (not bugfix / platform-specific)
-- **419** candidates after file-level filter
-- **98** skipped (files don't exist in v0.13.0)
-- Top subsystems: models (94), kernels (83), worker (45), quantization (31), api/frontend (30), attention (27)
+Phase 4 adds: `blame_score`, `blame_detail`
 
 ## Next Steps
 
-1. Review the Phase 3 CSV — filter by subsystem and priority
+1. Review the Phase 4 CSV — filter by blame score, subsystem, and priority
 2. Scope to RHAI's actual deployment (which models, features, quantization methods)
 3. Create a GitHub milestone for confirmed backports
 4. Use vLLM's built-in cherry-pick script: `.buildkite/scripts/cherry-pick-from-milestone.sh`
@@ -86,14 +96,10 @@ Answering these questions could eliminate 50%+ of candidates:
 - **Quantization methods?** FP8, GPTQ, AWQ, NVFP4 each have dedicated fixes
 - **LoRA / speculative decoding / tool calling / disaggregated serving?** Skip if unused
 
-### C. Blame-level filter (medium effort, higher precision)
-
-Check whether the specific **lines** each PR modifies existed in v0.13.0 (not just the file). Uses `git blame` at the merge commit's parent to determine when each modified line was introduced. This would reduce false positives from the file-level filter. Currently not implemented due to a line-number-drift issue that needs to be resolved.
-
-### D. Severity signals from GitHub (medium effort)
+### C. Severity signals from GitHub (medium effort)
 
 PRs fixing issues with many reactions/comments are higher-impact. Keywords like "Critical" or "regression" signal severity.
 
-### E. Group related PRs (low effort, review efficiency)
+### D. Group related PRs (low effort, review efficiency)
 
 Some PRs are "fix the fix" chains. Grouping by file overlap lets reviewers handle related fixes together.
